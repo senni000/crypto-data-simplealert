@@ -17,6 +17,8 @@ const createMockDatabaseManager = (): MockedDatabaseManager => ({
   getRecentAlerts: jest.fn().mockResolvedValue([]),
   saveOrderFlowRatioData: jest.fn().mockResolvedValue(undefined),
   saveSkewRawData: jest.fn().mockResolvedValue(undefined),
+  getOrderFlowRatioSeries: jest.fn().mockResolvedValue([]),
+  getSkewRawSeries: jest.fn().mockResolvedValue([]),
 });
 
 const webhookUrl = 'https://discord.com/api/webhooks/test';
@@ -47,12 +49,11 @@ describe('AlertManager', () => {
       await manager.sendDiscordAlert(message);
 
       expect(httpClient.post).toHaveBeenCalledTimes(1);
-      expect(httpClient.post).toHaveBeenCalledWith(
-        expect.stringContaining(webhookUrl),
-        expect.objectContaining({
-          content: expect.stringContaining('CP_DELTA_25'),
-        }),
-      );
+      const [url, payload] = httpClient.post.mock.calls[0];
+      expect(url).toContain(webhookUrl);
+      expect(payload).toMatchObject({
+        content: expect.stringContaining('CP_DELTA_25'),
+      });
       expect(db.saveAlertHistory).toHaveBeenCalledWith(
         expect.objectContaining({
           alertType: 'CP_DELTA_25',

@@ -10,6 +10,9 @@ import {
   AlertHistory,
   OrderFlowRatioData,
   SkewRawData,
+  ExpiryType,
+  DeltaBucket,
+  OptionType,
 } from '../types';
 import { LogLevel } from '../types/config';
 
@@ -76,6 +79,11 @@ export interface IAlertManager {
    * Send alert for large block trades
    */
   sendBlockTradeAlert(trade: TradeData): Promise<void>;
+
+  /**
+   * Send chart image or other attachments to Discord
+   */
+  sendDiscordImage(options: { buffer: Buffer; filename: string; content?: string }): Promise<void>;
 }
 
 /**
@@ -141,6 +149,28 @@ export interface IDatabaseManager {
    * Save raw skew data points
    */
   saveSkewRawData(data: SkewRawData[]): Promise<void>;
+
+  /**
+   * Retrieve order flow ratio series
+   */
+  getOrderFlowRatioSeries(params: {
+    expiryType: ExpiryType;
+    deltaBucket: DeltaBucket;
+    optionType: OptionType;
+    since?: number;
+    limit?: number;
+  }): Promise<OrderFlowRatioData[]>;
+
+  /**
+   * Retrieve skew raw data series
+   */
+  getSkewRawSeries(params: {
+    expiryType: ExpiryType;
+    deltaBucket: DeltaBucket;
+    optionType: OptionType;
+    since?: number;
+    limit?: number;
+  }): Promise<SkewRawData[]>;
 }
 
 /**

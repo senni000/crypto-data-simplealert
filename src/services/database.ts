@@ -13,6 +13,9 @@ import {
   AlertHistory,
   OrderFlowRatioData,
   SkewRawData,
+  ExpiryType,
+  DeltaBucket,
+  OptionType,
 } from '../types';
 import { IDatabaseManager } from './interfaces';
 
@@ -702,6 +705,103 @@ export class DatabaseManager implements IDatabaseManager {
           });
         }
       });
+    });
+  }
+
+  /**
+   * Retrieve order flow ratio series for analytics calculations
+   */
+  async getOrderFlowRatioSeries(params: {
+    expiryType: ExpiryType;
+    deltaBucket: DeltaBucket;
+    optionType: OptionType;
+    since?: number;
+    limit?: number;
+  }): Promise<OrderFlowRatioData[]> {
+    const db = this.getDatabase();
+    const since = params.since ?? (Date.now() - 24 * 60 * 60 * 1000);
+    const limit = params.limit ?? 2000;
+
+    const selectSql = `
+      SELECT
+        timestamp,
+        expiry_type as expiryType,
+        expiry_timestamp as expiryTimestamp,
+        delta_bucket as deltaBucket,
+        option_type as optionType,
+        ratio
+      FROM order_flow_ratio
+      WHERE expiry_type = ?
+        AND delta_bucket = ?
+        AND option_type = ?
+        AND timestamp >= ?
+      ORDER BY timestamp ASC
+      LIMIT ?
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.all(
+        selectSql,
+        [params.expiryType, params.deltaBucket, params.optionType, since, limit],
+        (err, rows) => {
+          if (err) {
+            console.error('Failed to fetch order flow ratio series:', err);
+            reject(err);
+          } else {
+            resolve(rows as OrderFlowRatioData[]);
+          }
+        }
+      );
+    });
+  }
+
+  /**
+   * Retrieve skew raw data series for analytics calculations
+   */
+  async getSkewRawSeries(params: {
+    expiryType: ExpiryType;
+    deltaBucket: DeltaBucket;
+    optionType: OptionType;
+    since?: number;
+    limit?: number;
+  }): Promise<SkewRawData[]> {
+    const db = this.getDatabase();
+    const since = params.since ?? (Date.now() - 24 * 60 * 60 * 1000);
+    const limit = params.limit ?? 2000;
+
+    const selectSql = `
+      SELECT
+        timestamp,
+        expiry_type as expiryType,
+        expiry_timestamp as expiryTimestamp,
+        delta_bucket as deltaBucket,
+        option_type as optionType,
+        mark_iv as markIv,
+        mark_price as markPrice,
+        delta,
+        index_price as indexPrice
+      FROM skew_raw_data
+      WHERE expiry_type = ?
+        AND delta_bucket = ?
+        AND option_type = ?
+        AND timestamp >= ?
+      ORDER BY timestamp ASC
+      LIMIT ?
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.all(
+        selectSql,
+        [params.expiryType, params.deltaBucket, params.optionType, since, limit],
+        (err, rows) => {
+          if (err) {
+            console.error('Failed to fetch skew raw data series:', err);
+            reject(err);
+          } else {
+            resolve(rows as SkewRawData[]);
+          }
+        }
+      );
     });
   }
 

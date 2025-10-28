@@ -5,6 +5,7 @@
 
 import { EventEmitter } from 'events';
 import axios, { AxiosResponse } from 'axios';
+import FormData from 'form-data';
 import { OptionData, TradeData, AlertMessage, CVDData } from '../types';
 import { IAlertManager, IDatabaseManager } from './interfaces';
 import {
@@ -39,6 +40,12 @@ export interface DiscordEmbedOptions {
   fields?: Array<{ name: string; value: string; inline?: boolean }>;
   imageUrl?: string;
   footer?: string;
+  content?: string;
+}
+
+export interface DiscordImageOptions {
+  buffer: Buffer;
+  filename: string;
   content?: string;
 }
 
@@ -248,6 +255,28 @@ export class AlertManager extends EventEmitter implements IAlertManager {
   }
 
   /**
+   * Send image with optional message to Discord webhook
+   */
+  async sendDiscordImage(options: DiscordImageOptions): Promise<void> {
+    const form = new FormData();
+    const payload = {
+      content: options.content ?? '',
+      allowed_mentions: { parse: [] as string[] },
+    };
+
+    form.append('payload_json', JSON.stringify(payload));
+    form.append('files[0]', options.buffer, {
+      filename: options.filename,
+      contentType: 'image/png',
+    });
+
+    await this.postToDiscord(form, {
+      errorContext: 'Failed to send image to Discord',
+      headers: form.getHeaders() as Record<string, string>,
+    });
+  }
+
+  /**
    * Notify Discord when a large block trade is detected
    */
   async sendBlockTradeAlert(trade: TradeData): Promise<void> {
@@ -359,8 +388,8 @@ export class AlertManager extends EventEmitter implements IAlertManager {
    * Post payload to Discord webhook with retry logic
    */
   private async postToDiscord(
-    payload: Record<string, unknown>,
-    options?: { onSuccess?: () => Promise<void>; errorContext?: string }
+    payload: unknown,
+    options?: { onSuccess?: () => Promise<void>; errorContext?: string; headers?: Record<string, string> }
   ): Promise<void> {
     if (!this.webhookUrl) {
       logger.warn('Discord webhook URL is not configured.');
@@ -372,7 +401,8 @@ export class AlertManager extends EventEmitter implements IAlertManager {
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       try {
-        const response = await this.httpClient.post(webhookUrl, payload);
+        const axiosConfig = options?.headers ? { headers: options.headers } : undefined;
+        const response = await this.httpClient.post(webhookUrl, payload, axiosConfig as any);
         const status = 'status' in response ? response.status : undefined;
         logger.debug('Discord webhook responded', { status });
 

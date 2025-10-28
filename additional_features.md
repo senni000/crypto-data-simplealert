@@ -1,90 +1,183 @@
-🧭 全体像
+アラート実装
+🧭 1. ratio 系アラート（flow）
+✅ 対象
 
-収集対象は Deribit の Public API（REST または WS）から：
+満期：0DTE と Front
 
-目的	データ種	満期	デルタ帯	取得間隔	保存
-板圧力の可視化	Bid/Ask Ratio	0DTE, Front, Next, Quarterly	10Δ / 25Δ / ATM	1分	ratio値のみ
-Skew impulse	IV, delta, mark price（raw）	同上	同上	1分（or 30秒）	rawデータ
+Δ帯：25Δ のみ
 
-👉 板の方は軽く、Skewの方は将来的なモデル検証用に生データを持っておく。
+指標：Bid/Ask ratio
 
-🧱 1. 対象とする満期（4種）
-ラベル	内容	例（2025/10/28基準）	備考
-0DTE	当日満期	2025-10-28	当日限り。daily option
-Front	当月末	2025-10-31	monthly expiry
-Next	翌月末	2025-11-28	monthly expiry
-Quarterly	次の四半期末	2025-12-26	quarterly expiry
+集計頻度：1分足
 
-✅ 実装では public/get_instruments で expiration_timestamp を取得し、
-残存日数から自動で 0DTE / front / next / quarterly に分類するとよいです。
+判定方法：Zスコア + スパイク検知（dRatio/dt）
 
-🧭 2. 対象デルタ帯（3種）
-Δ帯	意味	主な役割
-10Δ	panic hedge, squeeze	イベント感度が高い
-25Δ	directional skew, ヘッジ初動	skew impulseのコア
-ATM	確認・追随シグナル	ノイズもあるが補助的
+📐 1-1. Zスコアベースの閾値
 
-📊 3. Bid/Ask Ratio データ収集
-✅ 目的
+Zスコア：
 
-・「板のバランス」から短期の方向圧力を把握する
-・保存するのは ratio 値だけ（軽量化）
+𝑍
+=
+𝑅
+𝑡
+−
+𝜇
+1
+𝑑
+𝜎
+1
+𝑑
+Z=
+σ
+1d
+	​
 
-✅ データソース
+R
+t
+	​
 
-public/get_order_book または WebSocket book.{instrument_name}
+−μ
+1d
+	​
 
-✅ 処理内容
+	​
 
-25Δの銘柄リストを取得（Call/Put別）
 
-best bid/ask ± $5 の範囲の数量を集計
+𝜇
+1
+𝑑
+μ
+1d
+	​
 
-bid / ask ratio を計算
+：過去1日分の ratio 平均
 
-1分ごとに保存
+𝜎
+1
+𝑑
+σ
+1d
+	​
 
-ratio = sum(bid_volume in ±5$) / sum(ask_volume in ±5$)
+：過去1日分の ratio 標準偏差
 
-✅ 保存例（DBスキーマ）
-timestamp	expiry_type	delta_bucket	option_type	ratio
-2025-10-28 09:00:00	front	25Δ	call	2.13
-2025-10-28 09:00:00	front	25Δ	put	0.87
-...	...	...	...	...
+𝑍
+≥
+2.0
+Z≥2.0 をスパイクとみなす
 
-👉 軽くてクエリもしやすい
-👉 ratioの分布から「閾値」や「zスコア」アラートも容易。
+→ 日中の板の厚さの偏り（通常ノイズ）を除外しやすい。
+→ 突発的な流動性偏り＝本物のフローである確率が高い。
 
-🧮 4. Skew Impulse データ収集
-✅ 目的
+⚡ 1-2. 突発スパイク検出（dRatio/dt）
 
-・Skew（RR / Slope）を後から計算・チューニング
-・生データを残すことで戦略のバックテストが可能
+dRatio/dt の計算：
 
-✅ データソース
+𝑑
+𝑅
+𝑎
+𝑡
+𝑖
+𝑜
+/
+𝑑
+𝑡
+=
+𝑅
+𝑎
+𝑡
+𝑖
+𝑜
+𝑡
+−
+𝑅
+𝑎
+𝑡
+𝑖
+𝑜
+𝑡
+−
+1
+dRatio/dt=Ratio
+t
+	​
 
-public/ticker（IV・delta・mark price・index price）
+−Ratio
+t−1
+	​
 
-必要なら public/get_book_summary_by_instrument（補完）
 
-✅ 処理内容
+（時間差1分）
 
-満期×デルタ帯ごとの銘柄を取得
+閾値の目安：
 
-IV, delta, mark_price, index_price を取得
+∣
+𝑑
+𝑅
+𝑎
+𝑡
+𝑖
+𝑜
+/
+𝑑
+𝑡
+∣
+≥
+0.8
+∣dRatio/dt∣≥0.8 で「急変」と判断
+（Zスコアが平常でも急変で検知可能）
 
-1分ごとにDBに保存
+例：
 
-✅ 保存例（DBスキーマ）
-timestamp	expiry_type	delta_bucket	option_type	mark_iv	mark_price	delta	index_price
-2025-10-28 09:00:00	front	25Δ	call	0.45	750	0.25	110,000
-2025-10-28 09:00:00	front	25Δ	put	0.55	790	-0.25	110,000
-...	...	...	...	...	...	...	...
+前の足 1.2 → 現在 3.0 ⇒ 
+𝑑
+𝑅
+𝑎
+𝑡
+𝑖
+𝑜
+/
+𝑑
+𝑡
+=
+1.8
+dRatio/dt=1.8 → 上方向急変
 
-👉 Skewの計算はここから後で行う（ストリームでも、オフラインでもOK）
+前の足 2.5 → 現在 0.7 ⇒ 
+𝑑
+𝑅
+𝑎
+𝑡
+𝑖
+𝑜
+/
+𝑑
+𝑡
+=
+−
+1.8
+dRatio/dt=−1.8 → 下方向急変
 
-🧮 5. RRとSlope計算の設計
-RR（25Δ Risk Reversal）
+👉 Zスコアで“絶対水準”を、dRatio/dtで“変化の初動”を拾う。
+
+📨 1-3. Discord通知内容（例）
+[ORDERFLOW ALERT]
+2025-10-28 04:58:00 | 0DTE | 25Δ | CALL
+ratio: 2.86 (Z=2.43) | dR/dt=+1.67
+→ Buy side dominance spike detected ⚡
+
+🧠 2. Skew impulse系アラート（vol）
+✅ 対象
+
+満期：0DTE / Front
+
+Δ帯：25Δ
+
+指標：RR（Risk Reversal）・Slope（Skewness）
+
+判定：閾値 + 変化率
+
+📐 2-1. RR
 𝑅
 𝑅
 =
@@ -115,18 +208,13 @@ call,25Δ
 	​
 
 
-→ アラート例：
+RR < -0.05 → Call skew spike
 
-RR < -0.05 で「Call skew優勢」
+RR > +0.05 → Put skew spike
 
-RR > 0.05 で「Put skew優勢」
+|dRR/dt| > 0.02 → 急変
 
-dRR/dt の急変も見る
-
-Slope（Skewness）
-
-線形近似または差分：
-
+📐 2-2. Slope
 𝑆
 𝑙
 𝑜
@@ -165,59 +253,104 @@ call,25Δ
 	​
 
 
-or
+Slope < -0.1 → Call skew spike
 
-𝐼
-𝑉
-=
-𝑎
-+
-𝑏
-×
-Δ
-IV=a+b×Δ
+Slope > 0.1 → Put skew spike
 
-で 
-𝑏
-b を取る
+|dSlope/dt| > 0.05 → 初動
 
-→ アラート例：
+📨 2-3. Discord通知内容（例）
+[SKEW ALERT]
+2025-10-28 04:58:00 | Front | 25Δ
+RR:-0.065 | dRR/dt:-0.028
+Slope:-0.12 | dSlope/dt:-0.062
+→ Call skew impulse detected 📈
 
-slope > 0.1（Put skew spike）
+🧠 3. コンビネーション（複合）アラート
 
-slope < -0.1（Call skew spike）
+あなたの意図する「本命のシグナル」はココ👇
 
-👉 RR は方向、Slope は変化の強さを見る。
+✅ 対象
 
-⏳ 6. 推奨収集間隔とデータ量
-データ種	間隔	理由	1ヶ月のデータ量目安
-Ratio	1分	フロー圧力は1分粒度で十分	軽い（数十万レコード）
-Skew Raw	1分（or 30秒）	Slope/RR検出に十分	6満期×6銘柄でも現実的
+満期：0DTE / Front
 
-👉 まずは 1分で十分。0DTEでさらに精度を上げたいなら0.5分や10秒に拡張可能。
+Δ帯：25Δ
 
-🧠 7. 改善ポイント・設計Tips
+トリガー：ratio系 + skew impulse系 同時 or 近接発生
 
-銘柄抽出は毎回しない → 起動時に get_instruments で対象を決めてキャッシュ
+📐 3-1. ロジック
+🟢 上方向（ロングサイド）
 
-0DTEは刻々と変わるので → 1日数回再スキャン（AM/PM）
+ratio Zscore ≥ 2 or dRatio/dt ≥ 0.8
 
-ratio計算は pre-processing 層（collector）に入れる
+RR < -0.05 or slope < -0.1（Call skew優勢）
 
-skewは rawデータだけ保存、計算は strategy 側（handler or バッチ）
+→ callフローによる squeeze 初動シグナル
 
-DBは軽量な Parquet or 時系列DB（例：InfluxDB, TimescaleDB）が◎
+🔴 下方向（ショートサイド）
 
-timestampはUTCで統一
+ratio Zscore ≤ -2 or dRatio/dt ≤ -0.8
 
-✅ まとめ：実装仕様整理
-項目	Ratio	Skew Raw
-満期	0DTE, Front, Next, Quarterly	同
-Δ帯	10Δ, 25Δ, ATM	同
-データ	bid/ask volume ±5$, ratio	IV, delta, mark_price, index_price
-取得API	get_order_book	ticker
-保存	ratioのみ	raw値全て
-間隔	1分	1分（30sも可）
-目的	order flow圧力の即時監視	skew impulse検出＋戦略開発
-処理	collector内で計算→保存	collectorでraw保存→後で計算
-戦略	ratio閾値＋skew impulse	RR/Slope閾値＋変化率アラート
+RR > +0.05 or slope > +0.1（Put skew優勢）
+
+→ putフローによる panic hedge / dump 初動シグナル
+
+⏳ 3-2. 発火条件
+
+同じ 1分足で両方の条件が満たされたとき
+
+または skew→ratio のタイムラグ ≤ 2分 以内
+
+👉 Skewが先に走って、板が続くケースも考慮
+👉 ratioだけでも skewだけでもアラートは出るが、「両方揃うと強いトリガー」として別枠アラート
+
+📨 3-3. Discord通知例
+[COMBO ALERT 🚨]
+2025-10-28 04:58:00 | 0DTE | 25Δ
+ratio: 2.46 (Z=2.38, dR/dt=+1.53)
+RR:-0.067 (dRR/dt=-0.031)
+Slope:-0.11
+→ CALL Skew Spike + Bid dominance
+>>> STRONG BUY PRESSURE SIGNAL ⚡
+
+🧮 4. 想定されるアラート本数
+種別	対象	判定粒度	満期×Δ帯×方向	本数（概算/1日）
+Ratio単独	25Δ	1分足	0DTE,Front × Call/Put	30〜60件
+RR/Slope単独	25Δ	1分足	同上	20〜40件
+複合（Combo）	25Δ	1分足	同上	5〜15件
+
+👉 ※これは BTC/ETH どちらも監視した場合の目安
+👉 実際には Zスコア＋dRatioフィルターで 大半のノイズはカット されます。
+
+🧪 5. ratioのrawデータに対する注意点
+
+あなたの例👇
+
+Next ATM put ratio = 0.0156
+Front ATM put ratio = 107.0000
+
+
+これはおそらく：
+
+板が薄い → 片側ゼロに近い
+
+一瞬の剥がれ・異常値
+
+⚠️ なので：
+
+ratio計算前に「bid/askの合計サイズが閾値未満なら無視」
+例）合計サイズが 10 USD 以下はスキップ
+
+ratio > 50 とかは outlier として除外
+
+Zスコアベースにすることでこうした外れ値は自然に弾ける
+
+👉 これで ダマシをかなり削減 できます。
+
+✅ まとめ：あなたのアラート構成
+アラート種別	対象	閾値・条件	備考
+Ratio Spike	25Δ, 0DTE/Front	Z≥2 or	dR/dt
+RR Spike	同上	RR< -0.05 or > 0.05 /	dRR/dt
+Slope Spike	同上	Slope < -0.1 or > 0.1 /	dSlope/dt
+Combo	同上	Ratio + RR/Slope同時発火	本命シグナル 🚀
+Outlier対策	ratio>50 or 板薄	除外処理	ダマシ対策

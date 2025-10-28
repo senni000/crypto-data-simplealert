@@ -9,6 +9,10 @@
 - SQLiteデータベースでのデータ永続化
 - CVD（Cumulative Volume Delta）のZ-score監視
 - C-P Δ25移動平均線の変化監視
+- 0DTE / Front の Bid/Ask Ratio スパイク検知（Zスコア / 1分差分）
+- 0DTE / Front の Skew Impulse 検知（Risk Reversal / Slope / 変化率）
+- Ratio × Skew の複合アラート（時間差 2 分以内の連動検知）
+- 4時間ごとの BTC/USD × 1M 25Δ Skew チャート生成・Discord 投稿
 - Discord Webhookによるアラート通知
 
 ## 実装機能とデータ保存先
@@ -31,11 +35,23 @@
 - `AlertManager.checkCPDelta25Alert` が `CPDelta25Calculator` でデルタが +0.25/-0.25 に最も近いコール・プットを選び、`MovingAverageMonitor`（期間 10）に値を渡して移動平均系列を維持します。
 
 ### アラートの種類
-- **CVD_ZSCORE（Discord テキスト）**  
+- **RATIO_SPIKE_CALL / RATIO_SPIKE_PUT（テキスト）**  
+  - 対象：0DTE / Front × 25Δ。1分足で Z スコア ≥ 2.0 または dRatio/dt ≥ 0.8 を満たすと発火。  
+  - Discord には ratio 値、Z スコア、1分差分、対象デルタを送信。
+
+- **SKEW_SPIKE_CALL / SKEW_SPIKE_PUT（テキスト）**  
+  - Risk Reversal（IV_put - IV_call）、Slope（差分/0.5）、それらの変化率が閾値（Call: RR≤-0.05 or Slope≤-0.1 / Put: RR≥0.05 or Slope≥0.1 / |dRR|≥0.02 / |dSlope|≥0.05）を超えた際に送信。  
+  - IV 情報は `skew_raw_data` から算出しています。
+
+- **COMBO_CALL / COMBO_PUT（テキスト）**  
+  - 同じ 1 分足、または Skew 発生後 2 分以内に Ratio も条件を満たした場合に複合アラートを送信。  
+  - 「CALL Skew Spike + Bid dominance」などのメッセージを出力。
+
+- **CVD_ZSCORE（テキスト）**  
   - 直近 24 時間の CVD 履歴に対する Z スコアが閾値（既定 2.0）を超過し、クールダウン 30 分を経過している場合に送信。  
   - 送信時には `alert_history` にアラート種別・値・閾値・メッセージを記録します。
 
-- **CP_DELTA_25（Discord テキスト）**  
+- **CP_DELTA_25（テキスト）**  
   - C-P Δ25 の移動平均（期間 10）が直前の平均から 5%以上変動し、クールダウン 15 分を過ぎている場合に送信。  
   - 抽出したコール・プット銘柄、変動率などをメッセージ化して `alert_history` に保存します。
 
@@ -58,6 +74,8 @@
 | `option_data` | REST 取得オプション情報    | `symbol`, `timestamp`, `underlying_price`, `mark_price`, `delta` など |
 | `cvd_data`    | CVD 値と Zスコアの履歴     | `timestamp`, `cvd_value`, `z_score`, `created_at` |
 | `alert_history` | 送信済みアラートの記録   | `alert_type`, `timestamp`, `value`, `threshold`, `message`, `created_at` |
+| `order_flow_ratio` | Ratio 指標の時系列    | `timestamp`, `expiry_type`, `expiry_timestamp`, `delta_bucket`, `option_type`, `ratio` |
+| `skew_raw_data`   | Skew計算用のIV等生データ | `timestamp`, `expiry_type`, `expiry_timestamp`, `delta_bucket`, `option_type`, `mark_iv`, `mark_price`, `delta`, `index_price` |
 
 ## セットアップ
 
@@ -157,3 +175,6 @@ src/
 ## ライセンス
 
 MIT
+- **定期レポート（画像）**  
+  - 4 時間ごとに 1M 25Δ Skew（Front 満期）と BTC/USD を重ねたチャートを生成し、Discord Webhook へ PNG 画像を投稿します。  
+  - Skew は Put IV − Call IV（%）で計算し、最大 100 日の移動平均線を併記します。

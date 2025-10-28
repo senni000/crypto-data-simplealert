@@ -82,7 +82,15 @@ export interface SkewRawData {
  * Alert message structure for notifications
  */
 export interface AlertMessage {
-  type: 'CP_DELTA_25' | 'CVD_ZSCORE';
+  type:
+    | 'CP_DELTA_25'
+    | 'CVD_ZSCORE'
+    | 'RATIO_SPIKE_CALL'
+    | 'RATIO_SPIKE_PUT'
+    | 'SKEW_SPIKE_CALL'
+    | 'SKEW_SPIKE_PUT'
+    | 'COMBO_CALL'
+    | 'COMBO_PUT';
   timestamp: number;
   value: number;
   threshold: number;

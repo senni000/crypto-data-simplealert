@@ -6,8 +6,16 @@
 import './utils/setup-logging';
 import { initializeConfig, getConfig } from './utils/config';
 import { logger } from './utils/logger';
-import { DatabaseManager, DataCollector, AlertManager, DataHealthMonitor, DatabaseBackupScheduler } from './services';
-import { TradeData, OptionData } from './types';
+import {
+  DatabaseManager,
+  DataCollector,
+  AlertManager,
+  DataHealthMonitor,
+  DatabaseBackupScheduler,
+  AnalyticsAlertProcessor,
+  SkewChartReporter,
+} from './services';
+import { TradeData, OptionData, AlertMessage } from './types';
 import { LogLevel } from './types/config';
 
 async function bootstrap(): Promise<void> {
@@ -53,18 +61,23 @@ async function bootstrap(): Promise<void> {
       })
     : null;
 
-  bindDataCollectorEvents(dataCollector, alertManager);
+  const analyticsAlertProcessor = new AnalyticsAlertProcessor(databaseManager, alertManager);
+  const skewChartReporter = new SkewChartReporter(databaseManager, alertManager);
+
+  bindDataCollectorEvents(dataCollector, alertManager, analyticsAlertProcessor);
   bindHealthMonitor(dataCollector, healthMonitor);
   bindAlertManagerEvents(alertManager);
+  bindAnalyticsProcessorEvents(analyticsAlertProcessor);
 
   setupGlobalErrorHandlers();
-  setupShutdownHooks(dataCollector, databaseManager, healthMonitor, backupScheduler);
+  setupShutdownHooks(dataCollector, databaseManager, healthMonitor, backupScheduler, skewChartReporter);
 
   await dataCollector.start();
   healthMonitor.start();
   if (backupScheduler) {
     backupScheduler.start();
   }
+  skewChartReporter.start();
 
   logger.info('Crypto Data Alert System is running');
 }
@@ -73,7 +86,11 @@ function setLogLevel(level: LogLevel): void {
   logger.setLevel(level);
 }
 
-function bindDataCollectorEvents(dataCollector: DataCollector, alertManager: AlertManager): void {
+function bindDataCollectorEvents(
+  dataCollector: DataCollector,
+  alertManager: AlertManager,
+  analyticsAlertProcessor: AnalyticsAlertProcessor
+): void {
   dataCollector.on('error', (error) => logger.error('DataCollector error event received', error));
   dataCollector.on('websocketError', (error) => logger.error('WebSocket client error', error));
   dataCollector.on('restError', (error) => logger.error('REST client error', error));
@@ -82,9 +99,12 @@ function bindDataCollectorEvents(dataCollector: DataCollector, alertManager: Ale
   dataCollector.on('ratioDataSaved', (count) => logger.debug(`Stored ${count} order flow ratio rows`));
   dataCollector.on('skewDataSaved', (count) => logger.debug(`Stored ${count} skew raw rows`));
   dataCollector.on('analyticsError', (error) => logger.error('Analytics collector error', error));
-  dataCollector.on('analyticsCollectionCompleted', (payload) =>
-    logger.debug('Analytics collection completed', payload)
-  );
+  dataCollector.on('analyticsCollectionCompleted', (payload) => {
+    logger.debug('Analytics collection completed', payload);
+    analyticsAlertProcessor
+      .processLatestAnalytics(payload.timestamp)
+      .catch((error) => logger.error('Failed to process analytics alerts', error));
+  });
   dataCollector.on('analyticsInstrumentsUpdated', (selection) =>
     logger.debug('Analytics instrument selection updated', selection)
   );
@@ -169,6 +189,20 @@ function bindAlertManagerEvents(alertManager: AlertManager): void {
   });
 }
 
+function bindAnalyticsProcessorEvents(analyticsAlertProcessor: AnalyticsAlertProcessor): void {
+  analyticsAlertProcessor.on('ratioAlert', (message: AlertMessage) => {
+    logger.info(`Ratio alert emitted: ${message.type}`, message);
+  });
+
+  analyticsAlertProcessor.on('skewAlert', (message: AlertMessage) => {
+    logger.info(`Skew alert emitted: ${message.type}`, message);
+  });
+
+  analyticsAlertProcessor.on('comboAlert', (message: AlertMessage) => {
+    logger.warn(`Combo alert emitted: ${message.type}`, message);
+  });
+}
+
 function setupGlobalErrorHandlers(): void {
   process.on('unhandledRejection', (reason) => {
     logger.error('Unhandled promise rejection', reason);
@@ -183,7 +217,8 @@ function setupShutdownHooks(
   dataCollector: DataCollector,
   databaseManager: DatabaseManager,
   healthMonitor: DataHealthMonitor,
-  backupScheduler: DatabaseBackupScheduler | null
+  backupScheduler: DatabaseBackupScheduler | null,
+  skewChartReporter: SkewChartReporter
 ): void {
   let isShuttingDown = false;
 
@@ -199,6 +234,7 @@ function setupShutdownHooks(
     if (backupScheduler) {
       backupScheduler.stop();
     }
+    skewChartReporter.stop();
 
     try {
       await dataCollector.stopCollection();
