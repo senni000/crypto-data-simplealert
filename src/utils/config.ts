@@ -26,6 +26,10 @@ export class ConfigManager implements IConfigManager {
     const backupPathRaw = this.getEnvVar('DATABASE_BACKUP_PATH', '/Volumes/buffalohd/crypto_data.db');
     const backupInterval = this.getNumberEnvVar('DATABASE_BACKUP_INTERVAL', 3600000);
     const backupRetentionDays = this.getNumberEnvVar('DATABASE_BACKUP_RETENTION_DAYS', 7);
+    const analyticsEnabled = this.getBooleanEnvVar('ENABLE_ANALYTICS_COLLECTION', true);
+    const analyticsInterval = this.getNumberEnvVar('ANALYTICS_INTERVAL_MS', 60000);
+    const analyticsRefreshInterval = this.getNumberEnvVar('ANALYTICS_REFRESH_INTERVAL_MS', 3600000);
+    const analyticsRatioWindowUsd = this.getNumberEnvVar('ANALYTICS_RATIO_WINDOW_USD', 5);
 
     const config: AppConfig = {
       discordWebhookUrl: this.getRequiredEnvVar('DISCORD_WEBHOOK_URL'),
@@ -38,6 +42,10 @@ export class ConfigManager implements IConfigManager {
       databaseBackupPath: this.expandPath(backupPathRaw),
       databaseBackupInterval: backupInterval,
       databaseBackupRetentionDays: backupRetentionDays,
+      analyticsEnabled,
+      analyticsIntervalMs: analyticsInterval,
+      analyticsInstrumentRefreshIntervalMs: analyticsRefreshInterval,
+      analyticsRatioWindowUsd: analyticsRatioWindowUsd,
     };
 
     if (!this.validateConfig(config)) {
@@ -90,6 +98,25 @@ export class ConfigManager implements IConfigManager {
       if (config.optionDataInterval > 86400000) { // Maximum 24 hours
         errors.push('OPTION_DATA_INTERVAL must be at most 86400000ms (24 hours)');
       }
+    }
+
+    if (config.analyticsIntervalMs !== undefined) {
+      if (config.analyticsIntervalMs < 10000) {
+        errors.push('ANALYTICS_INTERVAL_MS must be at least 10000ms (10 seconds)');
+      }
+      if (config.analyticsIntervalMs > 3600000) {
+        errors.push('ANALYTICS_INTERVAL_MS must be at most 3600000ms (1 hour)');
+      }
+    }
+
+    if (config.analyticsInstrumentRefreshIntervalMs !== undefined) {
+      if (config.analyticsInstrumentRefreshIntervalMs < 600000) {
+        errors.push('ANALYTICS_REFRESH_INTERVAL_MS must be at least 600000ms (10 minutes)');
+      }
+    }
+
+    if (config.analyticsRatioWindowUsd !== undefined && config.analyticsRatioWindowUsd <= 0) {
+      errors.push('ANALYTICS_RATIO_WINDOW_USD must be greater than 0');
     }
 
     // Validate CVD Z-Score threshold

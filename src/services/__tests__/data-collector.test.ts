@@ -6,21 +6,25 @@
 import { DataCollector } from '../data-collector';
 import { DeribitWebSocketClient } from '../websocket-client';
 import { DeribitRestClient } from '../rest-client';
+import { DeribitAnalyticsCollector } from '../deribit-analytics-collector';
 import { IDatabaseManager } from '../interfaces';
 import { TradeData, OptionData } from '../../types';
 
 // Mock the client classes
 jest.mock('../websocket-client');
 jest.mock('../rest-client');
+jest.mock('../deribit-analytics-collector');
 
 const MockedWebSocketClient = DeribitWebSocketClient as jest.MockedClass<typeof DeribitWebSocketClient>;
 const MockedRestClient = DeribitRestClient as jest.MockedClass<typeof DeribitRestClient>;
+const MockedAnalyticsCollector = DeribitAnalyticsCollector as jest.MockedClass<typeof DeribitAnalyticsCollector>;
 
 describe('DataCollector', () => {
   let dataCollector: DataCollector;
   let mockDatabaseManager: jest.Mocked<IDatabaseManager>;
   let mockWsClient: jest.Mocked<DeribitWebSocketClient>;
   let mockRestClient: jest.Mocked<DeribitRestClient>;
+  let mockAnalyticsCollector: jest.Mocked<DeribitAnalyticsCollector>;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -37,6 +41,8 @@ describe('DataCollector', () => {
       getCVDDataSince: jest.fn().mockResolvedValue([]),
       saveAlertHistory: jest.fn().mockResolvedValue(undefined),
       getRecentAlerts: jest.fn().mockResolvedValue([]),
+      saveOrderFlowRatioData: jest.fn().mockResolvedValue(undefined),
+      saveSkewRawData: jest.fn().mockResolvedValue(undefined),
     } as unknown as jest.Mocked<IDatabaseManager>;
 
     // Mock WebSocket client
@@ -68,6 +74,17 @@ describe('DataCollector', () => {
     MockedWebSocketClient.mockImplementation(() => mockWsClient);
     MockedRestClient.mockImplementation(() => mockRestClient);
 
+    mockAnalyticsCollector = {
+      start: jest.fn().mockResolvedValue(undefined),
+      stop: jest.fn().mockResolvedValue(undefined),
+      isCollecting: jest.fn().mockReturnValue(false),
+      on: jest.fn(),
+      emit: jest.fn(),
+      removeAllListeners: jest.fn(),
+    } as unknown as jest.Mocked<DeribitAnalyticsCollector>;
+
+    MockedAnalyticsCollector.mockImplementation(() => mockAnalyticsCollector);
+
     dataCollector = new DataCollector(mockDatabaseManager, {
       websocketUrl: 'wss://test.deribit.com/ws/api/v2',
       restApiUrl: 'https://test.deribit.com/api/v2',
@@ -98,6 +115,16 @@ describe('DataCollector', () => {
         retryDelay: 1000,
         intervalMs: 1000,
       });
+
+      expect(MockedAnalyticsCollector).toHaveBeenCalledWith(
+        mockDatabaseManager,
+        expect.objectContaining({
+          apiUrl: 'https://test.deribit.com/api/v2',
+          intervalMs: 60000,
+          instrumentRefreshIntervalMs: 3600000,
+          ratioPriceWindowUsd: 5,
+        })
+      );
     });
 
     it('should setup event handlers for clients', () => {
@@ -108,6 +135,12 @@ describe('DataCollector', () => {
 
       expect(mockRestClient.on).toHaveBeenCalledWith('optionData', expect.any(Function));
       expect(mockRestClient.on).toHaveBeenCalledWith('error', expect.any(Function));
+
+      expect(mockAnalyticsCollector.on).toHaveBeenCalledWith('ratioDataSaved', expect.any(Function));
+      expect(mockAnalyticsCollector.on).toHaveBeenCalledWith('skewDataSaved', expect.any(Function));
+      expect(mockAnalyticsCollector.on).toHaveBeenCalledWith('collectionCompleted', expect.any(Function));
+      expect(mockAnalyticsCollector.on).toHaveBeenCalledWith('instrumentsUpdated', expect.any(Function));
+      expect(mockAnalyticsCollector.on).toHaveBeenCalledWith('error', expect.any(Function));
     });
   });
 
@@ -182,6 +215,7 @@ describe('DataCollector', () => {
       mockWsClient.connect.mockResolvedValue();
       mockWsClient.subscribeToBTCTrades.mockResolvedValue();
       mockRestClient.testConnection.mockResolvedValue(true);
+      mockAnalyticsCollector.start.mockResolvedValue();
 
       await dataCollector.start();
 
@@ -189,16 +223,19 @@ describe('DataCollector', () => {
       expect(mockWsClient.subscribeToBTCTrades).toHaveBeenCalled();
       expect(mockRestClient.testConnection).toHaveBeenCalled();
       expect(mockRestClient.startPeriodicCollection).toHaveBeenCalled();
+      expect(mockAnalyticsCollector.start).toHaveBeenCalled();
     });
 
     it('should stop all collection processes', async () => {
       mockDatabaseManager.saveTradeData.mockResolvedValue();
       mockDatabaseManager.saveOptionData.mockResolvedValue();
+      mockAnalyticsCollector.stop.mockResolvedValue();
 
       await dataCollector.stopCollection();
 
       expect(mockWsClient.disconnect).toHaveBeenCalled();
       expect(mockRestClient.stopPeriodicCollection).toHaveBeenCalled();
+      expect(mockAnalyticsCollector.stop).toHaveBeenCalled();
     });
 
     it('should handle start errors gracefully', async () => {
@@ -419,6 +456,7 @@ describe('DataCollector', () => {
     it('should return correct status information', () => {
       mockWsClient.isConnected.mockReturnValue(true);
       mockRestClient.isCollecting.mockReturnValue(true);
+      mockAnalyticsCollector.isCollecting.mockReturnValue(true);
 
       const status = dataCollector.getStatus();
 
@@ -428,6 +466,7 @@ describe('DataCollector', () => {
         restClientRunning: true,
         tradeBufferSize: 0,
         optionBufferSize: 0,
+        analyticsRunning: true,
       });
     });
 

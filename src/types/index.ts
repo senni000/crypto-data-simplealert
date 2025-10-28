@@ -37,6 +37,48 @@ export interface OptionData {
 }
 
 /**
+ * Option expiry分類
+ */
+export type ExpiryType = '0DTE' | 'Front' | 'Next' | 'Quarterly';
+
+/**
+ * 対象デルタ帯
+ */
+export type DeltaBucket = '10D' | '25D' | 'ATM';
+
+/**
+ * オプション種別
+ */
+export type OptionType = 'call' | 'put';
+
+/**
+ * 板圧力（Bid/Ask Ratio）用のデータ構造
+ */
+export interface OrderFlowRatioData {
+  timestamp: number;
+  expiryType: ExpiryType;
+  expiryTimestamp?: number;
+  deltaBucket: DeltaBucket;
+  optionType: OptionType;
+  ratio: number;
+}
+
+/**
+ * Skew Impulse向けの生データ構造
+ */
+export interface SkewRawData {
+  timestamp: number;
+  expiryType: ExpiryType;
+  expiryTimestamp?: number;
+  deltaBucket: DeltaBucket;
+  optionType: OptionType;
+  markIv: number;
+  markPrice: number;
+  delta: number;
+  indexPrice: number;
+}
+
+/**
  * Alert message structure for notifications
  */
 export interface AlertMessage {

@@ -15,6 +15,8 @@ const createMockDatabaseManager = (): MockedDatabaseManager => ({
   getCVDDataSince: jest.fn().mockResolvedValue([] as CVDData[]),
   saveAlertHistory: jest.fn().mockResolvedValue(undefined),
   getRecentAlerts: jest.fn().mockResolvedValue([]),
+  saveOrderFlowRatioData: jest.fn().mockResolvedValue(undefined),
+  saveSkewRawData: jest.fn().mockResolvedValue(undefined),
 });
 
 const webhookUrl = 'https://discord.com/api/webhooks/test';

@@ -23,6 +23,10 @@ async function bootstrap(): Promise<void> {
   const dataCollector = new DataCollector(databaseManager, {
     websocketUrl: config.deribitApiUrl,
     optionDataInterval: config.optionDataInterval,
+    enableAnalyticsCollection: config.analyticsEnabled,
+    analyticsIntervalMs: config.analyticsIntervalMs,
+    analyticsInstrumentRefreshIntervalMs: config.analyticsInstrumentRefreshIntervalMs,
+    analyticsRatioPriceWindowUsd: config.analyticsRatioWindowUsd,
   });
 
   const alertManager = new AlertManager(databaseManager, {
@@ -75,6 +79,15 @@ function bindDataCollectorEvents(dataCollector: DataCollector, alertManager: Ale
   dataCollector.on('restError', (error) => logger.error('REST client error', error));
   dataCollector.on('tradeDataSaved', (count) => logger.debug(`Stored ${count} trades`));
   dataCollector.on('optionDataSaved', (count) => logger.debug(`Stored ${count} options`));
+  dataCollector.on('ratioDataSaved', (count) => logger.debug(`Stored ${count} order flow ratio rows`));
+  dataCollector.on('skewDataSaved', (count) => logger.debug(`Stored ${count} skew raw rows`));
+  dataCollector.on('analyticsError', (error) => logger.error('Analytics collector error', error));
+  dataCollector.on('analyticsCollectionCompleted', (payload) =>
+    logger.debug('Analytics collection completed', payload)
+  );
+  dataCollector.on('analyticsInstrumentsUpdated', (selection) =>
+    logger.debug('Analytics instrument selection updated', selection)
+  );
 
   dataCollector.on('tradeDataReceived', (trades: TradeData[]) => {
     alertManager.checkCVDAlert(trades).catch((error) => {

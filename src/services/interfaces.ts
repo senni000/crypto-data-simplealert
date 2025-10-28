@@ -2,7 +2,15 @@
  * Service interfaces for the Crypto Data Alert System
  */
 
-import { TradeData, OptionData, AlertMessage, CVDData, AlertHistory } from '../types';
+import {
+  TradeData,
+  OptionData,
+  AlertMessage,
+  CVDData,
+  AlertHistory,
+  OrderFlowRatioData,
+  SkewRawData,
+} from '../types';
 import { LogLevel } from '../types/config';
 
 /**
@@ -19,6 +27,10 @@ export interface AppConfig {
   databaseBackupPath: string;
   databaseBackupInterval: number;
   databaseBackupRetentionDays: number;
+  analyticsEnabled: boolean;
+  analyticsIntervalMs: number;
+  analyticsInstrumentRefreshIntervalMs: number;
+  analyticsRatioWindowUsd: number;
 }
 
 /**
@@ -119,6 +131,16 @@ export interface IDatabaseManager {
    * Get recent alerts for cooldown checks
    */
   getRecentAlerts(alertType: string, minutes?: number): Promise<AlertHistory[]>;
+
+  /**
+   * Save calculated order flow ratio values
+   */
+  saveOrderFlowRatioData(data: OrderFlowRatioData[]): Promise<void>;
+
+  /**
+   * Save raw skew data points
+   */
+  saveSkewRawData(data: SkewRawData[]): Promise<void>;
 }
 
 /**

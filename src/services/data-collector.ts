@@ -8,6 +8,7 @@ import { TradeData, OptionData } from '../types';
 import { IDataCollector, IDatabaseManager } from './interfaces';
 import { DeribitWebSocketClient } from './websocket-client';
 import { DeribitRestClient } from './rest-client';
+import { DeribitAnalyticsCollector } from './deribit-analytics-collector';
 
 export interface DataCollectorOptions {
   websocketUrl: string;
@@ -15,6 +16,10 @@ export interface DataCollectorOptions {
   optionDataInterval?: number;
   enableTradeCollection?: boolean;
   enableOptionCollection?: boolean;
+  enableAnalyticsCollection?: boolean;
+  analyticsIntervalMs?: number;
+  analyticsInstrumentRefreshIntervalMs?: number;
+  analyticsRatioPriceWindowUsd?: number;
 }
 
 /**
@@ -23,6 +28,7 @@ export interface DataCollectorOptions {
 export class DataCollector extends EventEmitter implements IDataCollector {
   private wsClient: DeribitWebSocketClient;
   private restClient: DeribitRestClient;
+  private analyticsCollector: DeribitAnalyticsCollector | null;
   private databaseManager: IDatabaseManager;
   private options: Required<DataCollectorOptions>;
   private isRunning = false;
@@ -37,6 +43,7 @@ export class DataCollector extends EventEmitter implements IDataCollector {
   private tradeRestartPromise: Promise<void> | null = null;
   private optionRestartPromise: Promise<void> | null = null;
   private systemRecoveryPromise: Promise<void> | null = null;
+  private analyticsRestartPromise: Promise<void> | null = null;
 
   constructor(
     databaseManager: IDatabaseManager,
@@ -52,6 +59,10 @@ export class DataCollector extends EventEmitter implements IDataCollector {
       optionDataInterval: options.optionDataInterval || 3600000, // 1 hour
       enableTradeCollection: options.enableTradeCollection ?? true,
       enableOptionCollection: options.enableOptionCollection ?? true,
+      enableAnalyticsCollection: options.enableAnalyticsCollection ?? true,
+      analyticsIntervalMs: options.analyticsIntervalMs ?? 60_000,
+      analyticsInstrumentRefreshIntervalMs: options.analyticsInstrumentRefreshIntervalMs ?? 60 * 60 * 1000,
+      analyticsRatioPriceWindowUsd: options.analyticsRatioPriceWindowUsd ?? 5,
     };
 
     // Initialize WebSocket client
@@ -71,6 +82,15 @@ export class DataCollector extends EventEmitter implements IDataCollector {
       retryDelay: 1000,
       intervalMs: this.options.optionDataInterval,
     });
+
+    this.analyticsCollector = this.options.enableAnalyticsCollection
+      ? new DeribitAnalyticsCollector(this.databaseManager, {
+          apiUrl: this.options.restApiUrl,
+          intervalMs: this.options.analyticsIntervalMs,
+          instrumentRefreshIntervalMs: this.options.analyticsInstrumentRefreshIntervalMs,
+          ratioPriceWindowUsd: this.options.analyticsRatioPriceWindowUsd,
+        })
+      : null;
 
     this.setupEventHandlers();
   }
@@ -144,6 +164,10 @@ export class DataCollector extends EventEmitter implements IDataCollector {
     // Stop REST client
     this.restClient.stopPeriodicCollection();
 
+    if (this.analyticsCollector) {
+      await this.analyticsCollector.stop();
+    }
+
     // Stop buffer flushing
     if (this.bufferFlushInterval) {
       clearInterval(this.bufferFlushInterval);
@@ -182,6 +206,10 @@ export class DataCollector extends EventEmitter implements IDataCollector {
       
       if (this.options.enableOptionCollection) {
         promises.push(this.startOptionDataCollection());
+      }
+
+      if (this.options.enableAnalyticsCollection && this.analyticsCollector) {
+        promises.push(this.analyticsCollector.start());
       }
 
       await Promise.all(promises);
@@ -246,6 +274,32 @@ export class DataCollector extends EventEmitter implements IDataCollector {
     this.restClient.on('periodicCollectionStopped', () => {
       console.log('Periodic option data collection stopped');
     });
+
+    if (this.analyticsCollector) {
+      this.analyticsCollector.on('ratioDataSaved', (count: number) => {
+        console.log(`Saved ${count} order flow ratio records`);
+        this.emit('ratioDataSaved', count);
+      });
+
+      this.analyticsCollector.on('skewDataSaved', (count: number) => {
+        console.log(`Saved ${count} skew raw records`);
+        this.emit('skewDataSaved', count);
+      });
+
+      this.analyticsCollector.on('collectionCompleted', (payload) => {
+        this.emit('analyticsCollectionCompleted', payload);
+      });
+
+      this.analyticsCollector.on('instrumentsUpdated', (selection) => {
+        this.emit('analyticsInstrumentsUpdated', selection);
+      });
+
+      this.analyticsCollector.on('error', (error) => {
+        console.error('Analytics collector error:', error);
+        this.emit('analyticsError', error);
+        this.emit('error', error);
+      });
+    }
   }
 
   /**
@@ -513,6 +567,25 @@ export class DataCollector extends EventEmitter implements IDataCollector {
   }
 
   /**
+   * Restart analytics data collection with optional context
+   */
+  async restartAnalyticsCollection(reason?: string): Promise<void> {
+    if (!this.options.enableAnalyticsCollection || !this.analyticsCollector) {
+      return;
+    }
+
+    if (this.analyticsRestartPromise) {
+      return this.analyticsRestartPromise;
+    }
+
+    this.analyticsRestartPromise = this.performAnalyticsRestart(reason).finally(() => {
+      this.analyticsRestartPromise = null;
+    });
+
+    return this.analyticsRestartPromise;
+  }
+
+  /**
    * Attempt to recover collectors after detecting system suspension/resume
    */
   async recoverFromSystemResume(): Promise<void> {
@@ -533,6 +606,10 @@ export class DataCollector extends EventEmitter implements IDataCollector {
 
     if (this.options.enableOptionCollection) {
       tasks.push(this.restartOptionDataCollection('system resume detected'));
+    }
+
+    if (this.options.enableAnalyticsCollection && this.analyticsCollector) {
+      tasks.push(this.restartAnalyticsCollection('system resume detected'));
     }
 
     this.systemRecoveryPromise = Promise.all(tasks)
@@ -597,6 +674,32 @@ export class DataCollector extends EventEmitter implements IDataCollector {
   }
 
   /**
+   * Internal helper to restart analytics collection
+   */
+  private async performAnalyticsRestart(reason?: string): Promise<void> {
+    if (!this.analyticsCollector) {
+      return;
+    }
+
+    const prefix = reason
+      ? `Restarting analytics data collection (${reason})`
+      : 'Restarting analytics data collection...';
+    console.log(prefix);
+
+    try {
+      await this.analyticsCollector.stop();
+      await this.analyticsCollector.start();
+
+      console.log('Analytics data collection restarted successfully');
+      this.emit('analyticsCollectionRestarted');
+    } catch (error) {
+      console.error('Failed to restart analytics data collection:', error);
+      this.emit('error', error);
+      throw error;
+    }
+  }
+
+  /**
    * Get collection status
    */
   getStatus(): {
@@ -605,6 +708,7 @@ export class DataCollector extends EventEmitter implements IDataCollector {
     restClientRunning: boolean;
     tradeBufferSize: number;
     optionBufferSize: number;
+    analyticsRunning: boolean;
   } {
     return {
       isRunning: this.isRunning,
@@ -612,6 +716,7 @@ export class DataCollector extends EventEmitter implements IDataCollector {
       restClientRunning: this.restClient.isCollecting(),
       tradeBufferSize: this.tradeDataBuffer.length,
       optionBufferSize: this.optionDataBuffer.length,
+      analyticsRunning: this.analyticsCollector?.isCollecting() ?? false,
     };
   }
 

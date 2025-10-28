@@ -6,7 +6,14 @@
 import sqlite3 from 'sqlite3';
 import path from 'path';
 import fs from 'fs';
-import { TradeData, OptionData, CVDData, AlertHistory } from '../types';
+import {
+  TradeData,
+  OptionData,
+  CVDData,
+  AlertHistory,
+  OrderFlowRatioData,
+  SkewRawData,
+} from '../types';
 import { IDatabaseManager } from './interfaces';
 
 export class DatabaseManager implements IDatabaseManager {
@@ -39,6 +46,7 @@ export class DatabaseManager implements IDatabaseManager {
 
           // Create tables and indexes
           this.createTables()
+            .then(() => this.ensureAnalyticsColumns())
             .then(() => this.createIndexes())
             .then(() => {
               console.log('Database initialized successfully');
@@ -99,6 +107,29 @@ export class DatabaseManager implements IDatabaseManager {
         threshold REAL NOT NULL,
         message TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS order_flow_ratio (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER NOT NULL,
+        expiry_type TEXT NOT NULL,
+        expiry_timestamp INTEGER,
+        delta_bucket TEXT NOT NULL,
+        option_type TEXT NOT NULL,
+        ratio REAL NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS skew_raw_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER NOT NULL,
+        expiry_type TEXT NOT NULL,
+        expiry_timestamp INTEGER,
+        delta_bucket TEXT NOT NULL,
+        option_type TEXT NOT NULL,
+        mark_iv REAL NOT NULL,
+        mark_price REAL NOT NULL,
+        delta REAL NOT NULL,
+        index_price REAL NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )`
     ];
 
@@ -134,7 +165,11 @@ export class DatabaseManager implements IDatabaseManager {
       'CREATE INDEX IF NOT EXISTS idx_option_data_symbol ON option_data(symbol)',
       'CREATE INDEX IF NOT EXISTS idx_cvd_data_timestamp ON cvd_data(timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_alert_history_timestamp ON alert_history(timestamp)',
-      'CREATE INDEX IF NOT EXISTS idx_alert_history_type ON alert_history(alert_type)'
+      'CREATE INDEX IF NOT EXISTS idx_alert_history_type ON alert_history(alert_type)',
+      'CREATE INDEX IF NOT EXISTS idx_order_flow_ratio_timestamp ON order_flow_ratio(timestamp)',
+      'CREATE INDEX IF NOT EXISTS idx_order_flow_ratio_bucket ON order_flow_ratio(expiry_type, delta_bucket, option_type)',
+      'CREATE INDEX IF NOT EXISTS idx_skew_raw_data_timestamp ON skew_raw_data(timestamp)',
+      'CREATE INDEX IF NOT EXISTS idx_skew_raw_data_bucket ON skew_raw_data(expiry_type, delta_bucket, option_type)'
     ];
 
     return new Promise((resolve, reject) => {
@@ -493,6 +528,178 @@ export class DatabaseManager implements IDatabaseManager {
           reject(err);
         } else {
           resolve(rows as AlertHistory[]);
+        }
+      });
+    });
+  }
+
+  /**
+   * Ensure new analytics columns exist on legacy databases
+   */
+  private async ensureAnalyticsColumns(): Promise<void> {
+    await this.addColumnIfMissing('order_flow_ratio', 'expiry_timestamp', 'INTEGER');
+    await this.addColumnIfMissing('skew_raw_data', 'expiry_timestamp', 'INTEGER');
+  }
+
+  /**
+   * Helper to add a column if it does not exist
+   */
+  private async addColumnIfMissing(table: string, column: string, definition: string): Promise<void> {
+    const db = this.getDatabase();
+
+    const columnExists = await new Promise<boolean>((resolve, reject) => {
+      db.all(`PRAGMA table_info(${table})`, (err, rows: Array<{ name: string }>) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(rows.some((row) => row.name === column));
+      });
+    }).catch((error) => {
+      console.error(`Failed to inspect table schema for ${table}:`, error);
+      return true;
+    });
+
+    if (columnExists) {
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`, (err) => {
+        if (err) {
+          console.error(`Failed to add column ${column} to ${table}:`, err);
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  /**
+   * Save order flow ratio data
+   */
+  async saveOrderFlowRatioData(data: OrderFlowRatioData[]): Promise<void> {
+    const db = this.getDatabase();
+
+    const insertSql = `
+      INSERT INTO order_flow_ratio (timestamp, expiry_type, expiry_timestamp, delta_bucket, option_type, ratio)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+
+        if (data.length === 0) {
+          db.run('COMMIT');
+          resolve();
+          return;
+        }
+
+        let completed = 0;
+        let hasError = false;
+
+        for (const item of data) {
+          db.run(insertSql, [
+            item.timestamp,
+            item.expiryType,
+            item.expiryTimestamp ?? null,
+            item.deltaBucket,
+            item.optionType,
+            item.ratio,
+          ], (err) => {
+            if (err && !hasError) {
+              hasError = true;
+              db.run('ROLLBACK');
+              console.error('Failed to save order flow ratio data:', err);
+              reject(err);
+              return;
+            }
+
+            completed++;
+            if (completed === data.length && !hasError) {
+              db.run('COMMIT', (commitErr) => {
+                if (commitErr) {
+                  console.error('Failed to commit order flow ratio data:', commitErr);
+                  reject(commitErr);
+                } else {
+                  resolve();
+                }
+              });
+            }
+          });
+        }
+      });
+    });
+  }
+
+  /**
+   * Save skew raw data
+   */
+  async saveSkewRawData(data: SkewRawData[]): Promise<void> {
+    const db = this.getDatabase();
+
+    const insertSql = `
+      INSERT INTO skew_raw_data (
+        timestamp,
+        expiry_type,
+        expiry_timestamp,
+        delta_bucket,
+        option_type,
+        mark_iv,
+        mark_price,
+        delta,
+        index_price
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+
+        if (data.length === 0) {
+          db.run('COMMIT');
+          resolve();
+          return;
+        }
+
+        let completed = 0;
+        let hasError = false;
+
+        for (const item of data) {
+          db.run(insertSql, [
+            item.timestamp,
+            item.expiryType,
+            item.expiryTimestamp ?? null,
+            item.deltaBucket,
+            item.optionType,
+            item.markIv,
+            item.markPrice,
+            item.delta,
+            item.indexPrice,
+          ], (err) => {
+            if (err && !hasError) {
+              hasError = true;
+              db.run('ROLLBACK');
+              console.error('Failed to save skew raw data:', err);
+              reject(err);
+              return;
+            }
+
+            completed++;
+            if (completed === data.length && !hasError) {
+              db.run('COMMIT', (commitErr) => {
+                if (commitErr) {
+                  console.error('Failed to commit skew raw data:', commitErr);
+                  reject(commitErr);
+                } else {
+                  resolve();
+                }
+              });
+            }
+          });
         }
       });
     });

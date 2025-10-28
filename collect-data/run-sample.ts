@@ -30,6 +30,10 @@ async function run(): Promise<void> {
   const dataCollector = new DataCollector(databaseManager, {
     websocketUrl: config.deribitApiUrl,
     optionDataInterval: config.optionDataInterval,
+    enableAnalyticsCollection: config.analyticsEnabled,
+    analyticsIntervalMs: config.analyticsIntervalMs,
+    analyticsInstrumentRefreshIntervalMs: config.analyticsInstrumentRefreshIntervalMs,
+    analyticsRatioPriceWindowUsd: config.analyticsRatioWindowUsd,
   });
 
   const dryRunClient: HttpClient | undefined = enableAlerts
@@ -104,6 +108,9 @@ function bindCollectorEvents(dataCollector: DataCollector, alertManager: AlertMa
   dataCollector.on('websocketDisconnected', (info) => logger.warn('WebSocket disconnected', info));
   dataCollector.on('websocketError', (error) => logger.error('WebSocket error', error));
   dataCollector.on('restError', (error) => logger.error('REST client error', error));
+  dataCollector.on('ratioDataSaved', (count) => logger.debug('Stored ratio batch', { count }));
+  dataCollector.on('skewDataSaved', (count) => logger.debug('Stored skew batch', { count }));
+  dataCollector.on('analyticsError', (error) => logger.error('Analytics collector error', error));
 }
 
 function bindAlertEvents(alertManager: AlertManager): void {
