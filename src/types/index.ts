@@ -1,40 +1,8 @@
+import { CvdAlertPayload } from '@crypto-data/cvd-core';
+
 /**
  * Core data types for the Crypto Data Alert System
  */
-
-/**
- * Trade data structure for storing transaction information
- */
-export interface TradeData {
-  symbol: string;
-  timestamp: number;
-  price: number;
-  amount: number;
-  direction: 'buy' | 'sell';
-  tradeId: string;
-  channel?: string;
-  markPrice?: number;
-  indexPrice?: number;
-  underlyingPrice?: number;
-  iv?: number;
-  isBlockTrade?: boolean;
-}
-
-/**
- * Option data structure for storing option-related information
- */
-export interface OptionData {
-  symbol: string;
-  timestamp: number;
-  underlyingPrice: number;
-  markPrice: number;
-  impliedVolatility: number;
-  delta: number;
-  gamma: number;
-  theta: number;
-  vega: number;
-  rho: number;
-}
 
 /**
  * Option expiry分類
@@ -85,10 +53,6 @@ export interface AlertMessage {
   type:
     | 'CP_DELTA_25'
     | 'CVD_ZSCORE'
-    | 'RATIO_SPIKE_CALL'
-    | 'RATIO_SPIKE_PUT'
-    | 'SKEW_SPIKE_CALL'
-    | 'SKEW_SPIKE_PUT'
     | 'COMBO_CALL'
     | 'COMBO_PUT';
   timestamp: number;
@@ -98,12 +62,53 @@ export interface AlertMessage {
 }
 
 /**
+ * Trade data structure for storing transaction information
+ */
+export interface TradeData {
+  symbol: string;
+  timestamp: number;
+  price: number;
+  amount: number;
+  direction: 'buy' | 'sell';
+  tradeId: string;
+  channel?: string;
+  markPrice?: number;
+  indexPrice?: number;
+  underlyingPrice?: number;
+  iv?: number;
+  isBlockTrade?: boolean;
+}
+
+export interface TradeDataRow extends TradeData {
+  rowId: number;
+}
+
+/**
+ * Option data structure for storing option-related information
+ */
+export interface OptionData {
+  symbol: string;
+  timestamp: number;
+  underlyingPrice: number;
+  markPrice: number;
+  impliedVolatility: number;
+  delta: number;
+  gamma: number;
+  theta: number;
+  vega: number;
+  rho: number;
+}
+
+/**
  * CVD (Cumulative Volume Delta) data structure
  */
 export interface CVDData {
+  symbol: string;
   timestamp: number;
   cvdValue: number;
   zScore: number;
+  delta: number;
+  deltaZScore: number;
 }
 
 /**
@@ -117,4 +122,15 @@ export interface AlertHistory {
   threshold: number;
   message: string;
   createdAt?: string;
+}
+
+export interface AlertQueueRecord {
+  id: number;
+  alertType: string;
+  timestamp: number;
+  payload: CvdAlertPayload;
+  attemptCount: number;
+  lastError?: string | null;
+  processedAt?: number | null;
+  createdAt?: number;
 }

@@ -13,12 +13,12 @@ import {
   AlertMessage,
 } from '../types';
 import { IDatabaseManager } from './interfaces';
-import { AlertManager } from './alert-manager';
 import { logger } from '../utils/logger';
 
 export interface AnalyticsAlertProcessorOptions {
   ratioZScoreThreshold?: number;
   ratioDerivativeThreshold?: number;
+  ratioMinThreshold?: number;
   callRrThreshold?: number;
   putRrThreshold?: number;
   callSlopeThreshold?: number;
@@ -31,6 +31,7 @@ export interface AnalyticsAlertProcessorOptions {
   comboCooldownMinutes?: number;
   ratioLookbackMs?: number;
   skewLookbackMs?: number;
+  comboZScoreFloor?: number;
 }
 
 type Direction = 'call' | 'put';
@@ -71,39 +72,36 @@ const STANDARD_DEVIATION_EPSILON = 1e-8;
 
 export class AnalyticsAlertProcessor extends EventEmitter {
   private readonly databaseManager: IDatabaseManager;
-  private readonly alertManager: AlertManager;
   private readonly options: Required<AnalyticsAlertProcessorOptions>;
   private isProcessing = false;
-  private lastRatioAlertTimestamps = new Map<string, number>();
-  private lastSkewAlertTimestamps = new Map<string, number>();
   private lastComboAlertTimestamps = new Map<string, number>();
   private lastRatioSignals = new Map<string, RatioSignal>();
   private lastSkewSignals = new Map<string, SkewSignal>();
 
   constructor(
     databaseManager: IDatabaseManager,
-    alertManager: AlertManager,
     options: AnalyticsAlertProcessorOptions = {}
   ) {
     super();
     this.databaseManager = databaseManager;
-    this.alertManager = alertManager;
 
     this.options = {
       ratioZScoreThreshold: options.ratioZScoreThreshold ?? 2.0,
-      ratioDerivativeThreshold: options.ratioDerivativeThreshold ?? 0.8,
-      callRrThreshold: options.callRrThreshold ?? -0.05,
-      putRrThreshold: options.putRrThreshold ?? 0.05,
-      callSlopeThreshold: options.callSlopeThreshold ?? -0.1,
-      putSlopeThreshold: options.putSlopeThreshold ?? 0.1,
+      ratioDerivativeThreshold: options.ratioDerivativeThreshold ?? 3.0,
+      ratioMinThreshold: options.ratioMinThreshold ?? 1.5,
+      callRrThreshold: options.callRrThreshold ?? 3.0,
+      putRrThreshold: options.putRrThreshold ?? 3.5,
+      callSlopeThreshold: options.callSlopeThreshold ?? -5.0,
+      putSlopeThreshold: options.putSlopeThreshold ?? 5.0,
       dRrThreshold: options.dRrThreshold ?? 0.02,
-      dSlopeThreshold: options.dSlopeThreshold ?? 0.05,
+      dSlopeThreshold: options.dSlopeThreshold ?? 0.1,
       comboLagMs: options.comboLagMs ?? 2 * 60 * 1000,
       ratioCooldownMinutes: options.ratioCooldownMinutes ?? 5,
       skewCooldownMinutes: options.skewCooldownMinutes ?? 5,
       comboCooldownMinutes: options.comboCooldownMinutes ?? 5,
       ratioLookbackMs: options.ratioLookbackMs ?? 24 * 60 * 60 * 1000,
       skewLookbackMs: options.skewLookbackMs ?? 24 * 60 * 60 * 1000,
+      comboZScoreFloor: options.comboZScoreFloor ?? 0.5,
     };
   }
 
@@ -219,6 +217,10 @@ export class AnalyticsAlertProcessor extends EventEmitter {
       return null;
     }
 
+    if (latest.ratio < this.options.ratioMinThreshold) {
+      return null;
+    }
+
     const triggerSource = triggeredByZ ? 'zscore' : 'derivative';
 
     const signal: RatioSignal = {
@@ -312,89 +314,14 @@ export class AnalyticsAlertProcessor extends EventEmitter {
   }
 
   private async processRatioSignal(signal: RatioSignal): Promise<void> {
-    const alertType = signal.optionType === 'call' ? 'RATIO_SPIKE_CALL' : 'RATIO_SPIKE_PUT';
-    const alertKey = this.makeKey(alertType, signal.expiryType);
-
-    if (!(await this.shouldSendAlert(alertKey, this.lastRatioAlertTimestamps, signal.timestamp, this.options.ratioCooldownMinutes))) {
-      this.lastRatioSignals.set(this.makeKey('RATIO_SIGNAL', signal.expiryType, signal.optionType), signal);
-      return;
-    }
-
-    const threshold =
-      signal.triggerSource === 'zscore'
-        ? this.options.ratioZScoreThreshold
-        : this.options.ratioDerivativeThreshold;
-
-    const derivativeFormatted = this.formatSigned(signal.derivative, 2);
-    const message = [
-      `[RATIO ALERT] ${signal.expiryType} | 25Δ | ${signal.optionType.toUpperCase()}`,
-      `ratio: ${signal.ratio.toFixed(2)} | Z: ${signal.zScore.toFixed(2)} | dR/dt: ${derivativeFormatted}`,
-      signal.optionType === 'call'
-        ? '→ Bid dominance detected (CALL flow)'
-        : '→ Bid dominance detected (PUT flow)',
-    ].join('\n');
-
-    const alertMessage: AlertMessage = {
-      type: alertType,
-      timestamp: signal.timestamp,
-      value: signal.ratio,
-      threshold,
-      message,
-    };
-
-    await this.alertManager.sendDiscordAlert(alertMessage);
-    this.lastRatioAlertTimestamps.set(alertKey, signal.timestamp);
-    this.emit('ratioAlert', alertMessage);
-
     const ratioSignalKey = this.makeKey('RATIO_SIGNAL', signal.expiryType, signal.optionType);
     this.lastRatioSignals.set(ratioSignalKey, signal);
-
     await this.trySendComboAlert(signal.expiryType, signal.optionType, signal.optionType);
   }
 
   private async processSkewSignal(signal: SkewSignal): Promise<void> {
-    const alertType = signal.direction === 'call' ? 'SKEW_SPIKE_CALL' : 'SKEW_SPIKE_PUT';
-    const alertKey = this.makeKey(alertType, signal.expiryType);
-
-    if (
-      !(await this.shouldSendAlert(
-        alertKey,
-        this.lastSkewAlertTimestamps,
-        signal.timestamp,
-        this.options.skewCooldownMinutes
-      ))
-    ) {
-      this.lastSkewSignals.set(this.makeKey('SKEW_SIGNAL', signal.expiryType, signal.direction), signal);
-      return;
-    }
-
-    const threshold =
-      signal.direction === 'call' ? this.options.callRrThreshold : this.options.putRrThreshold;
-
-    const message = [
-      `[SKEW ALERT] ${signal.expiryType} | 25Δ | ${signal.direction.toUpperCase()}`,
-      `RR: ${signal.rr.toFixed(3)} | dRR/dt: ${this.formatSigned(signal.dRr, 3)}`,
-      `Slope: ${signal.slope.toFixed(3)} | dSlope/dt: ${this.formatSigned(signal.dSlope, 3)}`,
-      signal.direction === 'call'
-        ? '→ Call skew impulse detected 📈'
-        : '→ Put skew impulse detected 📉',
-    ].join('\n');
-
-    const alertMessage: AlertMessage = {
-      type: alertType,
-      timestamp: signal.timestamp,
-      value: signal.rr,
-      threshold,
-      message,
-    };
-
-    await this.alertManager.sendDiscordAlert(alertMessage);
-    this.lastSkewAlertTimestamps.set(alertKey, signal.timestamp);
-    this.emit('skewAlert', alertMessage);
-
     const skewSignalKey = this.makeKey('SKEW_SIGNAL', signal.expiryType, signal.direction);
     this.lastSkewSignals.set(skewSignalKey, signal);
-
     const ratioOption: OptionType = signal.direction === 'call' ? 'call' : 'put';
     await this.trySendComboAlert(signal.expiryType, signal.direction, ratioOption);
   }
@@ -411,6 +338,10 @@ export class AnalyticsAlertProcessor extends EventEmitter {
     const skewSignal = this.lastSkewSignals.get(skewKey);
 
     if (!ratioSignal || !skewSignal) {
+      return;
+    }
+
+    if (ratioSignal.zScore < this.options.comboZScoreFloor) {
       return;
     }
 
@@ -465,7 +396,24 @@ export class AnalyticsAlertProcessor extends EventEmitter {
       message: comboMessage,
     };
 
-    await this.alertManager.sendDiscordAlert(alertMessage);
+    try {
+      await this.databaseManager.saveAlertHistory({
+        alertType: alertMessage.type,
+        timestamp: alertMessage.timestamp,
+        value: alertMessage.value,
+        threshold: alertMessage.threshold,
+        message: alertMessage.message,
+      });
+      logger.debug('Persisted combo alert without notification', {
+        alertType,
+        expiryType,
+        direction,
+      });
+    } catch (error) {
+      logger.error('Failed to persist combo alert history', error);
+      return;
+    }
+
     this.lastComboAlertTimestamps.set(alertKey, ratioTimestamp);
     this.emit('comboAlert', alertMessage);
   }

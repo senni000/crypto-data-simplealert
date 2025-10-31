@@ -409,18 +409,6 @@ export class DeribitWebSocketClient extends EventEmitter {
           throw new Error(`Invalid price value: ${price}`);
         }
 
-        const amountValue = typeof trade.amount === 'number'
-          ? trade.amount
-          : typeof trade.quantity === 'number'
-            ? trade.quantity
-            : typeof trade.contracts === 'number'
-              ? trade.contracts
-              : undefined;
-
-        if (typeof amountValue !== 'number' || amountValue <= 0) {
-          throw new Error(`Invalid amount value: ${amountValue}`);
-        }
-
         const directionRaw = trade.direction?.toLowerCase();
         const direction = directionRaw?.includes('sell')
           ? 'sell'
@@ -437,11 +425,13 @@ export class DeribitWebSocketClient extends EventEmitter {
           throw new Error(`Invalid timestamp value: ${timestamp}`);
         }
 
+        const amount = this.normalizeTradeAmount(trade, channel);
+
         const tradeData: TradeData = {
           symbol: trade.instrument_name,
           timestamp,
           price,
-          amount: amountValue,
+          amount,
           direction,
           tradeId,
           channel,
@@ -471,6 +461,48 @@ export class DeribitWebSocketClient extends EventEmitter {
     }
 
     return trades;
+  }
+
+  private normalizeTradeAmount(
+    trade: DeribitTradeMessage['params']['data'][number],
+    channel?: string
+  ): number {
+    let rawAmount: number | undefined;
+    if (typeof trade.amount === 'number' && Number.isFinite(trade.amount)) {
+      rawAmount = trade.amount;
+    } else if (typeof trade.quantity === 'number' && Number.isFinite(trade.quantity)) {
+      rawAmount = trade.quantity;
+    } else if (typeof trade.contracts === 'number' && Number.isFinite(trade.contracts)) {
+      rawAmount = trade.contracts;
+    }
+
+    if (rawAmount === undefined || rawAmount <= 0) {
+      throw new Error(`Invalid amount value: ${rawAmount}`);
+    }
+
+    const symbol = trade.instrument_name ?? '';
+    if (!symbol) {
+      return rawAmount;
+    }
+
+    if (channel?.startsWith('block_trade.')) {
+      return rawAmount;
+    }
+
+    if (symbol.includes('PERPETUAL') || symbol.endsWith('-PERP') || symbol.endsWith('-USD')) {
+      const price =
+        typeof trade.price === 'number' && trade.price > 0
+          ? trade.price
+          : typeof trade.mark_price === 'number' && trade.mark_price > 0
+            ? trade.mark_price
+            : undefined;
+
+      if (price !== undefined) {
+        return rawAmount / price;
+      }
+    }
+
+    return rawAmount;
   }
 
   /**

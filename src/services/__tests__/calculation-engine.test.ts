@@ -66,9 +66,9 @@ describe('ZScoreCalculator', () => {
 
   it('derives z-score from CVD historical data', () => {
     const historical: CVDData[] = [
-      { timestamp: 1, cvdValue: 5, zScore: 0 },
-      { timestamp: 2, cvdValue: 10, zScore: 0 },
-      { timestamp: 3, cvdValue: 15, zScore: 0 },
+      { symbol: 'BTC-PERP', timestamp: 1, cvdValue: 5, zScore: 0, delta: 0, deltaZScore: 0 },
+      { symbol: 'BTC-PERP', timestamp: 2, cvdValue: 10, zScore: 0, delta: 0, deltaZScore: 0 },
+      { symbol: 'BTC-PERP', timestamp: 3, cvdValue: 15, zScore: 0, delta: 0, deltaZScore: 0 },
     ];
 
     const zScore = ZScoreCalculator.calculateCVDZScore(20, historical);

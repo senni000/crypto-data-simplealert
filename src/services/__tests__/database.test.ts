@@ -279,10 +279,14 @@ describe('DatabaseManager', () => {
   });
 
   describe('CVD Data Operations', () => {
+    const cvdSymbol = 'BTC-PERP';
     const sampleCVDData: CVDData = {
+      symbol: cvdSymbol,
       timestamp: Date.now(),
       cvdValue: 1500.75,
-      zScore: 2.5
+      zScore: 2.5,
+      delta: 0,
+      deltaZScore: 0,
     };
 
     it('should save CVD data successfully', async () => {
@@ -294,22 +298,28 @@ describe('DatabaseManager', () => {
       
       // Save old CVD data (25 hours ago)
       const oldCVDData: CVDData = {
-        timestamp: now - (25 * 60 * 60 * 1000),
+        symbol: cvdSymbol,
+        timestamp: now - 25 * 60 * 60 * 1000,
         cvdValue: 1000,
-        zScore: 1.0
+        zScore: 1.0,
+        delta: 0,
+        deltaZScore: 0,
       };
       
       // Save recent CVD data (1 hour ago)
       const recentCVDData: CVDData = {
-        timestamp: now - (1 * 60 * 60 * 1000),
+        symbol: cvdSymbol,
+        timestamp: now - 1 * 60 * 60 * 1000,
         cvdValue: 1500,
-        zScore: 2.0
+        zScore: 2.0,
+        delta: 0,
+        deltaZScore: 0,
       };
       
       await dbManager.saveCVDData(oldCVDData);
       await dbManager.saveCVDData(recentCVDData);
       
-      const retrieved = await dbManager.getCVDDataLast24Hours();
+      const retrieved = await dbManager.getCVDDataLast24Hours(cvdSymbol);
       
       // Should only return recent CVD data
       expect(retrieved).toHaveLength(1);
@@ -319,7 +329,7 @@ describe('DatabaseManager', () => {
 
     it('should maintain data integrity for CVD data', async () => {
       await dbManager.saveCVDData(sampleCVDData);
-      const retrieved = await dbManager.getCVDDataLast24Hours();
+      const retrieved = await dbManager.getCVDDataLast24Hours(cvdSymbol);
       
       expect(retrieved).toHaveLength(1);
       expect(retrieved[0]!).toMatchObject({

@@ -1,6 +1,8 @@
 import { DatabaseManager } from '../database';
 import { AlertManager } from '../alert-manager';
-import { OptionData, TradeData } from '../../types';
+import { AlertQueueProcessor } from '../alert-queue-processor';
+import { OptionData } from '../../types';
+import { CvdAlertPayload } from '@crypto-data/cvd-core';
 
 describe('System Integration', () => {
   jest.setTimeout(10000);
@@ -57,50 +59,48 @@ describe('System Integration', () => {
   });
 
   describe('CVD Alert Flow', () => {
-    it('stores CVD history and raises alerts when threshold exceeded', async () => {
+    it('dispatches queued payloads via alert processor', async () => {
       const databaseManager = new DatabaseManager(':memory:');
       await databaseManager.initializeDatabase();
+
+      const payload: CvdAlertPayload = {
+        symbol: 'BTC-PERP',
+        timestamp: Date.now(),
+        triggerSource: 'cumulative',
+        triggerZScore: 3.1,
+        zScore: 3.1,
+        delta: 1.2,
+        deltaZScore: 2.1,
+        threshold: 2.5,
+        cumulativeValue: 25,
+      };
+
+      await databaseManager.enqueueAlert('CVD_ZSCORE', payload, payload.timestamp);
 
       const httpClient = { post: jest.fn().mockResolvedValue({ status: 204 }) };
       const alertManager = new AlertManager(databaseManager, {
         webhookUrl: 'https://discord.com/api/webhooks/test',
         httpClient,
-        cvdThreshold: 1.5,
-        cvdCooldownMinutes: 0,
+        maxRetries: 0,
       });
 
-      const baseTimestamp = Date.now() - 60 * 60 * 1000;
-      await databaseManager.saveCVDData({ timestamp: baseTimestamp, cvdValue: 5, zScore: 0 });
-      await databaseManager.saveCVDData({ timestamp: baseTimestamp + 1000, cvdValue: 6, zScore: 0 });
-      await databaseManager.saveCVDData({ timestamp: baseTimestamp + 2000, cvdValue: 7, zScore: 0 });
+      const processor = new AlertQueueProcessor(databaseManager, alertManager, {
+        pollIntervalMs: 10,
+        batchSize: 10,
+        maxAttempts: 1,
+      });
 
-      const trades: TradeData[] = [
-        {
-          symbol: 'BTC-PERPETUAL',
-          timestamp: Date.now(),
-          price: 45000,
-          amount: 4,
-          direction: 'buy',
-          tradeId: 'trade-1',
-        },
-        {
-          symbol: 'BTC-PERPETUAL',
-          timestamp: Date.now(),
-          price: 45010,
-          amount: 3,
-          direction: 'buy',
-          tradeId: 'trade-2',
-        },
-      ];
+      const processed = new Promise<void>((resolve) => {
+        processor.once('alertSent', () => resolve());
+      });
 
-      await alertManager.checkCVDAlert(trades);
+      await processor.start();
+      await processed;
+      await processor.stop();
 
       expect(httpClient.post).toHaveBeenCalledTimes(1);
       const cvdAlerts = await databaseManager.getRecentAlerts('CVD_ZSCORE', 60);
       expect(cvdAlerts).toHaveLength(1);
-
-      const storedCvd = await databaseManager.getCVDDataLast24Hours();
-      expect(storedCvd.length).toBeGreaterThanOrEqual(4);
 
       await databaseManager.closeDatabase();
     });

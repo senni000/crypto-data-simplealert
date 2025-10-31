@@ -1,6 +1,7 @@
 import { AlertManager } from '../alert-manager';
 import { IDatabaseManager } from '../interfaces';
 import { OptionData, TradeData, AlertMessage, CVDData, AlertHistory } from '../../types';
+import { CvdAlertPayload } from '@crypto-data/cvd-core';
 
 type MockedDatabaseManager = jest.Mocked<IDatabaseManager>;
 
@@ -19,6 +20,17 @@ const createMockDatabaseManager = (): MockedDatabaseManager => ({
   saveSkewRawData: jest.fn().mockResolvedValue(undefined),
   getOrderFlowRatioSeries: jest.fn().mockResolvedValue([]),
   getSkewRawSeries: jest.fn().mockResolvedValue([]),
+  getTradeDataSinceRowId: jest.fn().mockResolvedValue([]),
+  getLargeTradeDataSinceRowId: jest.fn().mockResolvedValue([]),
+  getLatestTradeCursor: jest.fn().mockResolvedValue(null),
+  getProcessingState: jest.fn().mockResolvedValue(null),
+  saveProcessingState: jest.fn().mockResolvedValue(undefined),
+  enqueueAlert: jest.fn().mockResolvedValue(1),
+  getPendingAlerts: jest.fn().mockResolvedValue([]),
+  markAlertProcessed: jest.fn().mockResolvedValue(undefined),
+  markAlertFailed: jest.fn().mockResolvedValue(undefined),
+  hasRecentAlertOrPending: jest.fn().mockResolvedValue(false),
+  closeDatabase: jest.fn().mockResolvedValue(undefined),
 });
 
 const webhookUrl = 'https://discord.com/api/webhooks/test';
@@ -204,75 +216,50 @@ describe('AlertManager', () => {
     });
   });
 
-  describe('checkCVDAlert', () => {
-    const createTrade = (amount: number, direction: 'buy' | 'sell', id: string): TradeData => ({
-      symbol: 'BTC-PERPETUAL',
+  describe('sendCvdAlertPayload', () => {
+    const payload: CvdAlertPayload = {
+      symbol: 'BTC-PERP',
       timestamp: Date.now(),
-      price: 45000,
-      amount,
-      direction,
-      tradeId: id,
-    });
+      triggerSource: 'cumulative',
+      triggerZScore: 3.2,
+      zScore: 3.2,
+      delta: 1.4,
+      deltaZScore: 2.0,
+      threshold: 2.5,
+      cumulativeValue: 25,
+    };
 
-    it('sends alert when z-score exceeds threshold', async () => {
+    it('sends formatted payload to Discord and records history', async () => {
       const db = createMockDatabaseManager();
-      db.getCVDDataLast24Hours.mockResolvedValue([
-        { timestamp: 1, cvdValue: 10, zScore: 0 },
-        { timestamp: 2, cvdValue: 12, zScore: 0 },
-        { timestamp: 3, cvdValue: 14, zScore: 0 },
-        { timestamp: 4, cvdValue: 16, zScore: 0 },
-      ]);
-
       const httpClient = { post: jest.fn().mockResolvedValue({ status: 204 }) };
 
       const manager = new AlertManager(db, {
         webhookUrl,
         httpClient,
-        cvdThreshold: 2,
-        cvdCooldownMinutes: 30,
       });
 
-      const trades = [
-        createTrade(6, 'buy', 't1'),
-        createTrade(3, 'buy', 't2'),
-      ];
+      await manager.sendCvdAlertPayload(payload);
 
-      await manager.checkCVDAlert(trades);
-
-      expect(db.saveCVDData).toHaveBeenCalledWith(
+      expect(httpClient.post).toHaveBeenCalledTimes(1);
+      expect(db.saveAlertHistory).toHaveBeenCalledWith(
         expect.objectContaining({
-          cvdValue: expect.any(Number),
-          zScore: expect.any(Number),
+          alertType: 'CVD_ZSCORE',
+          threshold: payload.threshold,
         }),
       );
-      expect(httpClient.post).toHaveBeenCalledTimes(1);
-      expect(db.saveAlertHistory).toHaveBeenCalledTimes(1);
-      expect(db.getRecentAlerts).toHaveBeenCalledWith('CVD_ZSCORE', 30);
     });
 
-    it('does not send alert when z-score is below threshold', async () => {
+    it('propagates errors from Discord delivery', async () => {
       const db = createMockDatabaseManager();
-      db.getCVDDataLast24Hours.mockResolvedValue([
-        { timestamp: 1, cvdValue: 10, zScore: 0 },
-        { timestamp: 2, cvdValue: 11, zScore: 0 },
-        { timestamp: 3, cvdValue: 10.5, zScore: 0 },
-      ]);
-
-      const httpClient = { post: jest.fn().mockResolvedValue({ status: 204 }) };
+      const httpClient = { post: jest.fn().mockRejectedValue(new Error('discord down')) };
 
       const manager = new AlertManager(db, {
         webhookUrl,
         httpClient,
+        maxRetries: 0,
       });
 
-      const trades = [
-        createTrade(0.1, 'buy', 't1'),
-        createTrade(0.05, 'sell', 't2'),
-      ];
-
-      await manager.checkCVDAlert(trades);
-
-      expect(httpClient.post).not.toHaveBeenCalled();
+      await expect(manager.sendCvdAlertPayload(payload)).rejects.toThrow('discord down');
       expect(db.saveAlertHistory).not.toHaveBeenCalled();
     });
   });

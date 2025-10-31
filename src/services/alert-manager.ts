@@ -6,15 +6,10 @@
 import { EventEmitter } from 'events';
 import axios, { AxiosResponse } from 'axios';
 import FormData from 'form-data';
-import { OptionData, TradeData, AlertMessage, CVDData } from '../types';
+import { OptionData, TradeData, AlertMessage } from '../types';
 import { IAlertManager, IDatabaseManager } from './interfaces';
-import {
-  CPDelta25Calculator,
-  MovingAverageMonitor,
-  CVDMonitor,
-  CVDCalculator,
-  ZScoreCalculator,
-} from './calculation-engine';
+import { CPDelta25Calculator, MovingAverageMonitor } from './calculation-engine';
+import { CvdAlertPayload } from '@crypto-data/cvd-core';
 import { AlertHistory } from '../types';
 import { logger } from '../utils/logger';
 
@@ -49,6 +44,17 @@ export interface DiscordImageOptions {
   content?: string;
 }
 
+const CVD_ALERT_EMOJI = '🟠';
+const JST_FORMATTER = new Intl.DateTimeFormat('ja-JP', {
+  timeZone: 'Asia/Tokyo',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+});
+
 /**
  * Main alert manager implementation
  */
@@ -58,7 +64,6 @@ export class AlertManager extends EventEmitter implements IAlertManager {
   private readonly httpClient: HttpClient;
   private readonly maxRetries: number;
   private readonly retryDelayMs: number;
-  private readonly cvdMonitor: CVDMonitor;
   private readonly movingAverageMonitor: MovingAverageMonitor;
   private readonly cvdCooldownMinutes: number;
   private readonly cpCooldownMinutes: number;
@@ -72,11 +77,7 @@ export class AlertManager extends EventEmitter implements IAlertManager {
     this.maxRetries = options.maxRetries ?? 3;
     this.retryDelayMs = options.retryDelayMs ?? 1000;
 
-    const cvdThreshold = options.cvdThreshold ?? 2.0;
     this.cvdCooldownMinutes = options.cvdCooldownMinutes ?? 30;
-    const cvdCooldown = this.cvdCooldownMinutes;
-    this.cvdMonitor = new CVDMonitor(cvdThreshold, cvdCooldown);
-
     const cpPeriod = options.cpPeriod ?? 10;
     const cpChangeThreshold = options.cpChangeThreshold ?? 0.05;
     this.cpCooldownMinutes = options.cpCooldownMinutes ?? 15;
@@ -128,53 +129,6 @@ export class AlertManager extends EventEmitter implements IAlertManager {
 
     await this.sendDiscordAlert(message);
     this.emit('cpDeltaAlert', message);
-  }
-
-  /**
-   * Check CVD Z-score conditions and send alerts if needed
-   */
-  async checkCVDAlert(tradeData: TradeData[]): Promise<void> {
-    if (!tradeData || tradeData.length === 0) {
-      return;
-    }
-
-    const timestamp = Date.now();
-    const historicalCVD = await this.databaseManager.getCVDDataLast24Hours();
-    const lastEntry = historicalCVD.length > 0 ? historicalCVD[historicalCVD.length - 1] : undefined;
-    const lastCVD = lastEntry ? lastEntry.cvdValue : 0;
-
-    const incrementalCVD = CVDCalculator.calculateBTCPerpetualCVD(tradeData);
-    const currentCVD = lastCVD + incrementalCVD;
-
-    const zScore = ZScoreCalculator.calculateCVDZScore(currentCVD, historicalCVD);
-
-    const cvdRecord: CVDData = {
-      timestamp,
-      cvdValue: currentCVD,
-      zScore,
-    };
-
-    await this.databaseManager.saveCVDData(cvdRecord);
-
-    const shouldAlert = this.cvdMonitor.checkZScoreThreshold(zScore, timestamp);
-    if (!shouldAlert) {
-      return;
-    }
-
-    if (await this.hasRecentAlert('CVD_ZSCORE', this.cvdCooldownMinutes)) {
-      return;
-    }
-
-    const message: AlertMessage = {
-      type: 'CVD_ZSCORE',
-      timestamp,
-      value: zScore,
-      threshold: this.cvdMonitor.getThreshold(),
-      message: this.buildCVDMessage(zScore, currentCVD),
-    };
-
-    await this.sendDiscordAlert(message);
-    this.emit('cvdAlert', message);
   }
 
   /**
@@ -362,25 +316,67 @@ export class AlertManager extends EventEmitter implements IAlertManager {
   /**
    * Build Discord message content for CVD alerts
    */
-  private buildCVDMessage(zScore: number, currentCVD: number): string {
-    const direction = zScore >= 0 ? '正' : '負';
+  private buildCVDMessage(payload: CvdAlertPayload): string {
+    const direction =
+      Math.abs(payload.triggerZScore) >= 1e-8
+        ? payload.triggerZScore >= 0
+          ? '買い優勢'
+          : '売り優勢'
+        : payload.cumulativeValue >= 0
+        ? '買い優勢'
+        : '売り優勢';
+    const formattedDelta = Math.abs(payload.delta).toFixed(2);
+    const formattedCumulative = payload.cumulativeValue.toFixed(2);
+    const formattedZScore = payload.zScore.toFixed(2);
+    const formattedDeltaZScore = payload.deltaZScore.toFixed(2);
+    const formattedTriggerZ = payload.triggerZScore.toFixed(2);
+    const formattedTime = JST_FORMATTER.format(new Date(payload.timestamp));
+    const triggerLabel = payload.triggerSource === 'cumulative' ? '累積' : '差分';
+
     return [
-      `CVD Z-Scoreが閾値を超過しました (${direction}).`,
-      `Z-Score: ${zScore.toFixed(2)}`,
-      `CVD値: ${currentCVD.toFixed(2)}`,
-    ].join(' | ');
+      `${CVD_ALERT_EMOJI}【Deribit CVD Alert】${payload.symbol}`,
+      `時間: ${formattedTime}`,
+      `方向: ${direction}`,
+      `直近期差分: ${formattedDelta}`,
+      `累積出来高差: ${formattedCumulative}`,
+      `Zスコア(累積): ${formattedZScore}`,
+      `Zスコア(差分): ${formattedDeltaZScore}`,
+      `トリガー: ${triggerLabel} (${formattedTriggerZ}) / 閾値: ${payload.threshold}`,
+    ].join('\n');
+  }
+
+  async sendCvdAlertPayload(payload: CvdAlertPayload): Promise<void> {
+    if (await this.hasRecentAlert('CVD_ZSCORE', this.cvdCooldownMinutes)) {
+      logger.debug('Skipping CVD alert due to cooldown window');
+      return;
+    }
+
+    const message: AlertMessage = {
+      type: 'CVD_ZSCORE',
+      timestamp: payload.timestamp,
+      value: payload.triggerZScore,
+      threshold: payload.threshold,
+      message: this.buildCVDMessage(payload),
+    };
+
+    await this.sendDiscordAlert(message);
+    this.emit('cvdAlert', message);
   }
 
   /**
    * Format final Discord payload content
    */
   private formatDiscordContent(message: AlertMessage): string {
-    const timestamp = new Date(message.timestamp).toISOString();
+    if (message.type === 'CVD_ZSCORE') {
+      return message.message;
+    }
+
+    const formattedTime = JST_FORMATTER.format(new Date(message.timestamp));
     return [
       `**${message.type} アラート**`,
       message.message,
       `値: ${message.value.toFixed(4)} / 閾値: ${message.threshold.toFixed(4)}`,
-      `時刻: ${timestamp}`,
+      `時間: ${formattedTime}`,
     ].join('\n');
   }
 

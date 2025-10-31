@@ -1,16 +1,22 @@
 {
-  "name": "crypto-data-alert",
+  "name": "@crypto-data/deribit",
   "version": "1.0.0",
   "description": "暗号通貨データ収集・アラートシステム - Deribit APIからBTCデータを収集し、Discord Webhookでアラート通知を送信",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "start:ingest": "DERIBIT_PROCESS_ROLE=ingest node dist/index.js",
+    "start:aggregate": "DERIBIT_PROCESS_ROLE=aggregate node dist/index.js",
+    "start:alert": "DERIBIT_PROCESS_ROLE=alert node dist/index.js",
     "dev": "ts-node src/index.ts",
+    "dev:ingest": "DERIBIT_PROCESS_ROLE=ingest ts-node src/index.ts",
+    "dev:aggregate": "DERIBIT_PROCESS_ROLE=aggregate ts-node src/index.ts",
+    "dev:alert": "DERIBIT_PROCESS_ROLE=alert ts-node src/index.ts",
     "test": "jest",
     "clean": "rm -rf dist",
     "start:pm2": "pm2 start ecosystem.config.js",
-    "stop:pm2": "pm2 stop crypto-data-alert && pm2 delete crypto-data-alert",
+    "stop:pm2": "pm2 delete deribit-ingest deribit-aggregate deribit-alert",
     "perf": "ts-node collect-data/perf-test.ts",
     "collect:sample": "ts-node collect-data/run-sample.ts",
     "check:db": "ts-node collect-data/check-db.ts"
@@ -26,6 +32,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@crypto-data/cvd-core": "workspace:*",
     "axios": "^1.6.2",
     "chart.js": "^4.5.1",
     "chartjs-node-canvas": "^5.0.0",

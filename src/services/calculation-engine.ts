@@ -4,6 +4,11 @@
  */
 
 import { TradeData, OptionData, CVDData } from '../types';
+import {
+  CvdCalculator as BaseCvdCalculator,
+  ZScoreCalculator as BaseZScoreCalculator,
+  CvdMonitor as BaseCvdMonitor,
+} from '@crypto-data/cvd-core';
 
 /**
  * CVD Calculator class for Cumulative Volume Delta calculations
@@ -14,18 +19,7 @@ export class CVDCalculator {
    * CVD = Σ(buy_volume - sell_volume)
    */
   static calculateCVD(tradeData: TradeData[]): number {
-    let cvd = 0;
-    
-    for (const trade of tradeData) {
-      const volume = trade.amount;
-      if (trade.direction === 'buy') {
-        cvd += volume;
-      } else if (trade.direction === 'sell') {
-        cvd -= volume;
-      }
-    }
-    
-    return cvd;
+    return BaseCvdCalculator.calculateCvd(tradeData);
   }
 
   /**
@@ -33,13 +27,13 @@ export class CVDCalculator {
    * Filters for BTC perpetual symbols and calculates CVD
    */
   static calculateBTCPerpetualCVD(tradeData: TradeData[]): number {
-    // Filter for BTC perpetual trades (symbols containing "BTC" and "PERPETUAL")
-    const btcPerpetualTrades = tradeData.filter(trade => 
-      trade.symbol.includes('BTC') && 
-      (trade.symbol.includes('PERPETUAL') || trade.symbol.includes('-PERP'))
+    const btcPerpetualTrades = tradeData.filter(
+      (trade) =>
+        trade.symbol.includes('BTC') &&
+        (trade.symbol.includes('PERPETUAL') || trade.symbol.includes('-PERP'))
     );
-    
-    return this.calculateCVD(btcPerpetualTrades);
+
+    return BaseCvdCalculator.calculateCvd(btcPerpetualTrades);
   }
 
   /**
@@ -47,8 +41,7 @@ export class CVDCalculator {
    * Used for real-time CVD updates
    */
   static calculateIncrementalCVD(currentCVD: number, newTrades: TradeData[]): number {
-    const incrementalCVD = this.calculateCVD(newTrades);
-    return currentCVD + incrementalCVD;
+    return currentCVD + this.calculateCVD(newTrades);
   }
 }
 
@@ -61,49 +54,14 @@ export class ZScoreCalculator {
    * Z-score = (value - mean) / standard_deviation
    */
   static calculateZScore(value: number, historicalValues: number[]): number {
-    if (historicalValues.length === 0) {
-      return 0;
-    }
-
-    const mean = this.calculateMean(historicalValues);
-    const standardDeviation = this.calculateStandardDeviation(historicalValues, mean);
-    
-    // Avoid division by zero
-    if (standardDeviation === 0) {
-      return 0;
-    }
-    
-    return (value - mean) / standardDeviation;
-  }
-
-  /**
-   * Calculate mean (average) of an array of numbers
-   */
-  private static calculateMean(values: number[]): number {
-    if (values.length === 0) return 0;
-    const sum = values.reduce((acc, val) => acc + val, 0);
-    return sum / values.length;
-  }
-
-  /**
-   * Calculate standard deviation of an array of numbers
-   */
-  private static calculateStandardDeviation(values: number[], mean?: number): number {
-    if (values.length === 0) return 0;
-    
-    const calculatedMean = mean ?? this.calculateMean(values);
-    const squaredDifferences = values.map(value => Math.pow(value - calculatedMean, 2));
-    const variance = squaredDifferences.reduce((acc, val) => acc + val, 0) / values.length;
-    
-    return Math.sqrt(variance);
+    return BaseZScoreCalculator.calculate(value, historicalValues);
   }
 
   /**
    * Calculate Z-score for CVD data using historical CVD values
    */
   static calculateCVDZScore(currentCVD: number, historicalCVDData: CVDData[]): number {
-    const historicalValues = historicalCVDData.map(data => data.cvdValue);
-    return this.calculateZScore(currentCVD, historicalValues);
+    return BaseZScoreCalculator.calculateFromRecords(currentCVD, historicalCVDData);
   }
 }
 
@@ -111,67 +69,31 @@ export class ZScoreCalculator {
  * CVD Monitor class for Z-score threshold monitoring
  */
 export class CVDMonitor {
-  private threshold: number;
-  private lastAlertTime: number = 0;
-  private cooldownPeriod: number = 30 * 60 * 1000; // 30 minutes in milliseconds
+  private readonly monitor: BaseCvdMonitor;
 
   constructor(threshold: number = 2.0, cooldownMinutes: number = 30) {
-    this.threshold = threshold;
-    this.cooldownPeriod = cooldownMinutes * 60 * 1000;
+    this.monitor = new BaseCvdMonitor(threshold, cooldownMinutes);
   }
 
   /**
    * Check if CVD Z-score exceeds threshold and alert conditions are met
    */
   checkZScoreThreshold(zScore: number, timestamp: number): boolean {
-    // Check if Z-score exceeds threshold
-    if (Math.abs(zScore) < this.threshold) {
-      return false;
-    }
-
-    // Check cooldown period to prevent spam alerts
-    if (timestamp - this.lastAlertTime < this.cooldownPeriod) {
-      return false;
-    }
-
-    // Update last alert time
-    this.lastAlertTime = timestamp;
-    return true;
+    return this.monitor.shouldTrigger(zScore, timestamp);
   }
 
   /**
    * Get current threshold value
    */
   getThreshold(): number {
-    return this.threshold;
-  }
-
-  /**
-   * Update threshold value
-   */
-  setThreshold(newThreshold: number): void {
-    this.threshold = newThreshold;
-  }
-
-  /**
-   * Get cooldown period in milliseconds
-   */
-  getCooldownPeriod(): number {
-    return this.cooldownPeriod;
-  }
-
-  /**
-   * Set cooldown period in minutes
-   */
-  setCooldownPeriod(minutes: number): void {
-    this.cooldownPeriod = minutes * 60 * 1000;
+    return this.monitor.getThreshold();
   }
 
   /**
    * Reset alert cooldown (for testing or manual reset)
    */
   resetCooldown(): void {
-    this.lastAlertTime = 0;
+    this.monitor.resetCooldown();
   }
 }
 

@@ -92,9 +92,6 @@ async function run(): Promise<void> {
 function bindCollectorEvents(dataCollector: DataCollector, alertManager: AlertManager): void {
   dataCollector.on('tradeDataReceived', (trades: TradeData[]) => {
     logger.debug(`Received trade batch`, { count: trades.length });
-    alertManager
-      .checkCVDAlert(trades)
-      .catch((error) => logger.error('CVD alert evaluation failed', error));
   });
 
   dataCollector.on('optionDataReceived', (options: OptionData[]) => {

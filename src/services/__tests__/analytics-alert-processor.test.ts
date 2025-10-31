@@ -1,11 +1,9 @@
 import { AnalyticsAlertProcessor } from '../analytics-alert-processor';
-import { AlertManager } from '../alert-manager';
 import { IDatabaseManager } from '../interfaces';
 import { ExpiryType, OrderFlowRatioData, SkewRawData } from '../../types';
 
 describe('AnalyticsAlertProcessor', () => {
   let mockDatabaseManager: jest.Mocked<IDatabaseManager>;
-  let mockAlertManager: jest.Mocked<AlertManager>;
   let processor: AnalyticsAlertProcessor;
 
   const ratioSeriesMap = new Map<string, OrderFlowRatioData[]>();
@@ -23,15 +21,13 @@ describe('AnalyticsAlertProcessor', () => {
         const key = skewKey(params.expiryType, params.optionType);
         return Promise.resolve(skewSeriesMap.get(key) ?? []);
       }),
+      saveAlertHistory: jest.fn().mockResolvedValue(undefined),
     } as unknown as jest.Mocked<IDatabaseManager>;
 
-    mockAlertManager = {
-      sendDiscordAlert: jest.fn().mockResolvedValue(undefined),
-    } as unknown as jest.Mocked<AlertManager>;
-
-    processor = new AnalyticsAlertProcessor(mockDatabaseManager, mockAlertManager, {
+    processor = new AnalyticsAlertProcessor(mockDatabaseManager, {
       ratioZScoreThreshold: 1.5,
       ratioDerivativeThreshold: 0.5,
+      ratioMinThreshold: 0.5,
       callRrThreshold: -0.02,
       putRrThreshold: 0.02,
       callSlopeThreshold: -0.05,
@@ -40,6 +36,7 @@ describe('AnalyticsAlertProcessor', () => {
       dSlopeThreshold: 0.02,
       ratioLookbackMs: 60 * 60 * 1000,
       skewLookbackMs: 60 * 60 * 1000,
+      comboZScoreFloor: 0,
     });
   });
 
@@ -59,10 +56,8 @@ describe('AnalyticsAlertProcessor', () => {
 
     await processor.processLatestAnalytics(baseTimestamp);
 
-    expect(mockAlertManager.sendDiscordAlert).toHaveBeenCalled();
-    const alertTypes = mockAlertManager.sendDiscordAlert.mock.calls.map((call) => call[0].type);
-    expect(alertTypes).toContain('RATIO_SPIKE_CALL');
-    expect(alertTypes).toContain('SKEW_SPIKE_CALL');
+    expect(mockDatabaseManager.saveAlertHistory).toHaveBeenCalled();
+    const alertTypes = mockDatabaseManager.saveAlertHistory.mock.calls.map((call) => call[0].alertType);
     expect(alertTypes).toContain('COMBO_CALL');
   });
 
@@ -80,9 +75,7 @@ describe('AnalyticsAlertProcessor', () => {
     await processor.processLatestAnalytics(baseTimestamp - 60 * 1000);
     await processor.processLatestAnalytics(baseTimestamp);
 
-    const alertTypes = mockAlertManager.sendDiscordAlert.mock.calls.map((call) => call[0].type);
-    expect(alertTypes).toContain('RATIO_SPIKE_PUT');
-    expect(alertTypes).toContain('SKEW_SPIKE_PUT');
+    const alertTypes = mockDatabaseManager.saveAlertHistory.mock.calls.map((call) => call[0].alertType);
     expect(alertTypes).toContain('COMBO_PUT');
   });
 

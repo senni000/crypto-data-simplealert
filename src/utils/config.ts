@@ -23,26 +23,62 @@ export class ConfigManager implements IConfigManager {
    */
   async loadConfig(): Promise<void> {
     const backupEnabled = this.getBooleanEnvVar('DATABASE_BACKUP_ENABLED', false);
-    const backupPathRaw = this.getEnvVar('DATABASE_BACKUP_PATH', '/Volumes/buffalohd/crypto_data.db');
-    const backupInterval = this.getNumberEnvVar('DATABASE_BACKUP_INTERVAL', 3600000);
-    const backupRetentionDays = this.getNumberEnvVar('DATABASE_BACKUP_RETENTION_DAYS', 7);
+    const backupDirectoryRaw = this.getEnvVar(
+      'DATABASE_BACKUP_PATH',
+      '/Volumes/buffalohd/crypto-data/backups/deribit'
+    );
+    const backupIntervalMs = this.getNumberEnvVar('DATABASE_BACKUP_INTERVAL_MS', 24 * 60 * 60 * 1000);
+    const retentionDays = this.getNumberEnvVar('DATABASE_RETENTION_DAYS', 3);
+    const databaseRetentionMs =
+      retentionDays > 0 ? Math.floor(retentionDays * 24 * 60 * 60 * 1000) : null;
     const analyticsEnabled = this.getBooleanEnvVar('ENABLE_ANALYTICS_COLLECTION', true);
+    const enableCvdAlerts = this.getBooleanEnvVar('ENABLE_CVD_ALERTS', true);
     const analyticsInterval = this.getNumberEnvVar('ANALYTICS_INTERVAL_MS', 60000);
     const analyticsRefreshInterval = this.getNumberEnvVar('ANALYTICS_REFRESH_INTERVAL_MS', 3600000);
     const analyticsRatioWindowUsd = this.getNumberEnvVar('ANALYTICS_RATIO_WINDOW_USD', 5);
+    const optionDataInterval = this.getNumberEnvVar('OPTION_DATA_INTERVAL', 3600000);
+    const cvdAggregationSymbol = this.getEnvVar('CVD_AGGREGATION_SYMBOL', 'BTC-PERP');
+    const cvdAggregationTradeSymbolsRaw = this.getEnvVar(
+      'CVD_AGGREGATION_TRADE_SYMBOLS',
+      'BTC-PERPETUAL,BTC-PERPETUAL-USDC'
+    );
+    const cvdAggregationTradeSymbols = this.parseSymbolList(cvdAggregationTradeSymbolsRaw);
+    const cvdAggregationBatchSize = this.getNumberEnvVar('CVD_AGGREGATION_BATCH_SIZE', 500);
+    const cvdAggregationPollIntervalMs = this.getNumberEnvVar('CVD_AGGREGATION_POLL_INTERVAL_MS', 2000);
+    const cvdAlertSuppressionMinutes = this.getNumberEnvVar('CVD_ALERT_SUPPRESSION_MINUTES', 30);
+    const alertQueuePollIntervalMs = this.getNumberEnvVar('ALERT_QUEUE_POLL_INTERVAL_MS', 5000);
+    const alertQueueBatchSize = this.getNumberEnvVar('ALERT_QUEUE_BATCH_SIZE', 50);
+    const alertQueueMaxAttempts = this.getNumberEnvVar('ALERT_QUEUE_MAX_ATTEMPTS', 5);
+    const alertOptionPollIntervalMs = this.getNumberEnvVar('ALERT_OPTION_POLL_INTERVAL_MS', optionDataInterval);
+    const analyticsAlertIntervalMs = this.getNumberEnvVar('ANALYTICS_ALERT_INTERVAL_MS', analyticsInterval);
+    const blockTradePollIntervalMs = this.getNumberEnvVar('BLOCK_TRADE_POLL_INTERVAL_MS', 10000);
+    const blockTradeAmountThreshold = this.getNumberEnvVar('BLOCK_TRADE_AMOUNT_THRESHOLD', 1000);
 
     const config: AppConfig = {
       discordWebhookUrl: this.getRequiredEnvVar('DISCORD_WEBHOOK_URL'),
-      databasePath: this.expandPath(this.getEnvVar('DATABASE_PATH', '~/workspace/crypto-data/data/crypto_data.db')),
+      databasePath: this.expandPath(this.getEnvVar('DATABASE_PATH', '~/workspace/crypto-data/data/deribit.db')),
       deribitApiUrl: this.getEnvVar('DERIBIT_API_URL', 'wss://www.deribit.com/ws/api/v2'),
-      optionDataInterval: this.getNumberEnvVar('OPTION_DATA_INTERVAL', 3600000),
+      optionDataInterval,
       cvdZScoreThreshold: this.getNumberEnvVar('CVD_ZSCORE_THRESHOLD', 2.0),
+      cvdAggregationSymbol,
+      cvdAggregationTradeSymbols,
+      cvdAggregationBatchSize,
+      cvdAggregationPollIntervalMs,
+      cvdAlertSuppressionMinutes,
+      alertQueuePollIntervalMs,
+      alertQueueBatchSize,
+      alertQueueMaxAttempts,
+      alertOptionPollIntervalMs,
+      analyticsAlertIntervalMs,
+      blockTradePollIntervalMs,
+      blockTradeAmountThreshold,
       logLevel: this.getLogLevel(this.getEnvVar('LOG_LEVEL', 'info') as LogLevel),
       databaseBackupEnabled: backupEnabled,
-      databaseBackupPath: this.expandPath(backupPathRaw),
-      databaseBackupInterval: backupInterval,
-      databaseBackupRetentionDays: backupRetentionDays,
+      databaseBackupDirectory: this.expandPath(backupDirectoryRaw),
+      databaseBackupIntervalMs: backupIntervalMs,
+      databaseRetentionMs,
       analyticsEnabled,
+      enableCvdAlerts,
       analyticsIntervalMs: analyticsInterval,
       analyticsInstrumentRefreshIntervalMs: analyticsRefreshInterval,
       analyticsRatioWindowUsd: analyticsRatioWindowUsd,
@@ -119,6 +155,61 @@ export class ConfigManager implements IConfigManager {
       errors.push('ANALYTICS_RATIO_WINDOW_USD must be greater than 0');
     }
 
+    if (config.analyticsAlertIntervalMs !== undefined && config.analyticsAlertIntervalMs < 5000) {
+      errors.push('ANALYTICS_ALERT_INTERVAL_MS must be at least 5000ms (5 seconds)');
+    }
+
+    if (config.alertQueuePollIntervalMs !== undefined && config.alertQueuePollIntervalMs < 1000) {
+      errors.push('ALERT_QUEUE_POLL_INTERVAL_MS must be at least 1000ms (1 second)');
+    }
+
+    if (config.alertQueueBatchSize !== undefined && config.alertQueueBatchSize <= 0) {
+      errors.push('ALERT_QUEUE_BATCH_SIZE must be greater than 0');
+    }
+
+    if (config.alertQueueMaxAttempts !== undefined && config.alertQueueMaxAttempts <= 0) {
+      errors.push('ALERT_QUEUE_MAX_ATTEMPTS must be greater than 0');
+    }
+
+    if (config.cvdAggregationBatchSize !== undefined && config.cvdAggregationBatchSize <= 0) {
+      errors.push('CVD_AGGREGATION_BATCH_SIZE must be greater than 0');
+    }
+
+    if (config.cvdAggregationPollIntervalMs !== undefined && config.cvdAggregationPollIntervalMs < 500) {
+      errors.push('CVD_AGGREGATION_POLL_INTERVAL_MS must be at least 500ms');
+    }
+
+    if (config.cvdAlertSuppressionMinutes !== undefined && config.cvdAlertSuppressionMinutes < 0) {
+      errors.push('CVD_ALERT_SUPPRESSION_MINUTES must be zero or positive');
+    }
+
+    if (config.alertOptionPollIntervalMs !== undefined && config.alertOptionPollIntervalMs < 1000) {
+      errors.push('ALERT_OPTION_POLL_INTERVAL_MS must be at least 1000ms (1 second)');
+    }
+
+    if (config.blockTradePollIntervalMs !== undefined && config.blockTradePollIntervalMs < 1000) {
+      errors.push('BLOCK_TRADE_POLL_INTERVAL_MS must be at least 1000ms (1 second)');
+    }
+
+    if (config.blockTradeAmountThreshold !== undefined && config.blockTradeAmountThreshold <= 0) {
+      errors.push('BLOCK_TRADE_AMOUNT_THRESHOLD must be greater than 0');
+    }
+
+    if (config.cvdAggregationSymbol !== undefined && !config.cvdAggregationSymbol.trim()) {
+      errors.push('CVD_AGGREGATION_SYMBOL must not be empty');
+    }
+
+    if (config.cvdAggregationTradeSymbols !== undefined) {
+      if (
+        !Array.isArray(config.cvdAggregationTradeSymbols) ||
+        config.cvdAggregationTradeSymbols.length === 0
+      ) {
+        errors.push('CVD_AGGREGATION_TRADE_SYMBOLS must contain at least one symbol');
+      } else if (config.cvdAggregationTradeSymbols.some((symbol) => !symbol.trim())) {
+        errors.push('CVD_AGGREGATION_TRADE_SYMBOLS must not contain empty entries');
+      }
+    }
+
     // Validate CVD Z-Score threshold
     if (config.cvdZScoreThreshold !== undefined) {
       if (config.cvdZScoreThreshold < 0.1) {
@@ -135,16 +226,14 @@ export class ConfigManager implements IConfigManager {
     }
 
     if (config.databaseBackupEnabled) {
-      if (!config.databaseBackupPath) {
+      if (!config.databaseBackupDirectory) {
         errors.push('DATABASE_BACKUP_PATH is required when DATABASE_BACKUP_ENABLED is true');
       }
-
-      if (config.databaseBackupInterval !== undefined && config.databaseBackupInterval < 60000) {
-        errors.push('DATABASE_BACKUP_INTERVAL must be at least 60000ms (1 minute)');
-      }
-
-      if (config.databaseBackupRetentionDays !== undefined && config.databaseBackupRetentionDays < 0) {
-        errors.push('DATABASE_BACKUP_RETENTION_DAYS must be greater than or equal to 0');
+      if (
+        config.databaseBackupIntervalMs !== undefined &&
+        config.databaseBackupIntervalMs < 60000
+      ) {
+        errors.push('DATABASE_BACKUP_INTERVAL_MS must be at least 60000ms (1 minute)');
       }
     }
 
@@ -155,6 +244,14 @@ export class ConfigManager implements IConfigManager {
     }
 
     return true;
+  }
+
+  private parseSymbolList(value: string): string[] {
+    return value
+      .split(/[,\s]+/)
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0)
+      .map((item) => item.toUpperCase());
   }
 
   /**

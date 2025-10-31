@@ -7,13 +7,14 @@
 - Deribit WebSocket APIを使用したBTC約定データのリアルタイム収集
 - Deribit REST APIを使用したBTCオプションデータの定期収集
 - SQLiteデータベースでのデータ永続化
-- CVD（Cumulative Volume Delta）のZ-score監視
+- CVD（Cumulative Volume Delta）のZ-score監視（DBキュー経由）
 - C-P Δ25移動平均線の変化監視
 - 0DTE / Front の Bid/Ask Ratio スパイク検知（Zスコア / 1分差分）
 - 0DTE / Front の Skew Impulse 検知（Risk Reversal / Slope / 変化率）
 - Ratio × Skew の複合アラート（時間差 2 分以内の連動検知）
 - 4時間ごとの BTC/USD × 1M 25Δ Skew チャート生成・Discord 投稿
 - Discord Webhookによるアラート通知
+- インジェスト / 集計 / アラートの 3 プロセス分離構成（PM2管理想定）
 
 ## 実装機能とデータ保存先
 
@@ -31,25 +32,17 @@
 - 取得頻度は `.env` の `OPTION_DATA_INTERVAL`（既定 1 時間）で制御され、エラーは指数バックオフ付きでリトライします。
 
 #### 派生指標の蓄積
-- `AlertManager.checkCVDAlert` が `CVDCalculator.calculateBTCPerpetualCVD` で BTC パーペチュアルの買い・売り約定量差を積算し、`cvd_data` テーブルへ Z スコア付きで追記します（直近 24 時間分を参照）。
+- `CvdAggregationWorker` が共有ライブラリ `@crypto-data/cvd-core` の累積 CVD アグリゲータを用いて `trade_data` の新規レコードを巡回し、`cvd_data` テーブルへ Z スコア付きで追記します（直近 24 時間分を参照）。閾値超過時は `alert_queue` に `CVD_ZSCORE` ペイロードを enqueue します。
 - `AlertManager.checkCPDelta25Alert` が `CPDelta25Calculator` でデルタが +0.25/-0.25 に最も近いコール・プットを選び、`MovingAverageMonitor`（期間 10）に値を渡して移動平均系列を維持します。
 
 ### アラートの種類
-- **RATIO_SPIKE_CALL / RATIO_SPIKE_PUT（テキスト）**  
-  - 対象：0DTE / Front × 25Δ。1分足で Z スコア ≥ 2.0 または dRatio/dt ≥ 0.8 を満たすと発火。  
-  - Discord には ratio 値、Z スコア、1分差分、対象デルタを送信。
-
-- **SKEW_SPIKE_CALL / SKEW_SPIKE_PUT（テキスト）**  
-  - Risk Reversal（IV_put - IV_call）、Slope（差分/0.5）、それらの変化率が閾値（Call: RR≤-0.05 or Slope≤-0.1 / Put: RR≥0.05 or Slope≥0.1 / |dRR|≥0.02 / |dSlope|≥0.05）を超えた際に送信。  
-  - IV 情報は `skew_raw_data` から算出しています。
-
 - **COMBO_CALL / COMBO_PUT（テキスト）**  
   - 同じ 1 分足、または Skew 発生後 2 分以内に Ratio も条件を満たした場合に複合アラートを送信。  
   - 「CALL Skew Spike + Bid dominance」などのメッセージを出力。
 
 - **CVD_ZSCORE（テキスト）**  
-  - 直近 24 時間の CVD 履歴に対する Z スコアが閾値（既定 2.0）を超過し、クールダウン 30 分を経過している場合に送信。  
-  - 送信時には `alert_history` にアラート種別・値・閾値・メッセージを記録します。
+  - `CvdAggregationWorker` が enqueue したペイロードを `AlertQueueProcessor` がポーリングし、Discord へ送信します。閾値（既定 2.0）とサプレッションウィンドウ（既定 30 分）を満たす場合のみ配送されます。  
+  - 配送完了後に `alert_history` にアラート種別・値・閾値・メッセージを記録します。
 
 - **CP_DELTA_25（テキスト）**  
   - C-P Δ25 の移動平均（期間 10）が直前の平均から 5%以上変動し、クールダウン 15 分を過ぎている場合に送信。  
@@ -70,12 +63,14 @@
 ### SQLite テーブル構成（`.env` の `DATABASE_PATH` に出力）
 | テーブル       | 役割                      | 主なカラム |
 |---------------|---------------------------|------------|
-| `trade_data`  | WebSocket 約定履歴        | `symbol`, `timestamp`, `price`, `amount`, `direction`, `trade_id`, `created_at` |
+| `trade_data`  | WebSocket 約定履歴        | `symbol`, `timestamp`, `price`, `amount`, `direction`, `trade_id`, `channel`, `mark_price`, `index_price`, `underlying_price`, `is_block_trade`, `created_at` |
 | `option_data` | REST 取得オプション情報    | `symbol`, `timestamp`, `underlying_price`, `mark_price`, `delta` など |
 | `cvd_data`    | CVD 値と Zスコアの履歴     | `timestamp`, `cvd_value`, `z_score`, `created_at` |
 | `alert_history` | 送信済みアラートの記録   | `alert_type`, `timestamp`, `value`, `threshold`, `message`, `created_at` |
 | `order_flow_ratio` | Ratio 指標の時系列    | `timestamp`, `expiry_type`, `expiry_timestamp`, `delta_bucket`, `option_type`, `ratio` |
 | `skew_raw_data`   | Skew計算用のIV等生データ | `timestamp`, `expiry_type`, `expiry_timestamp`, `delta_bucket`, `option_type`, `mark_iv`, `mark_price`, `delta`, `index_price` |
+| `processing_state` | 各ワーカーの進捗カーソル | `process_name`, `key`, `last_row_id`, `last_timestamp`, `updated_at` |
+| `alert_queue`      | 非同期アラート配送キュー  | `alert_type`, `timestamp`, `payload_json`, `attempt_count`, `last_error`, `processed_at`, `created_at` |
 
 ## セットアップ
 
@@ -98,9 +93,9 @@ cp .env.example .env
 - `DISCORD_WEBHOOK_URL`: Discord WebhookのURL
 - `DATABASE_PATH`: SQLiteデータベースファイルのパス
 - `LOG_LEVEL`: ログ出力レベル（`error` / `warn` / `info` / `debug`）
-- `DATABASE_BACKUP_ENABLED`: 定期バックアップを有効にする場合は `true`  
-- `DATABASE_BACKUP_PATH`: バックアップ先（例: `/Volumes/buffalohd/crypto_data.db`）
-- `DATABASE_BACKUP_INTERVAL`: バックアップ間隔 (ms) ※ デフォルト 3600000 (1時間)
+- `DATABASE_BACKUP_ENABLED`: 定期バックアップを有効にする場合は `true`
+- `DATABASE_BACKUP_PATH`: バックアップを保存するディレクトリ（例: `/Volumes/buffalohd/crypto-data/backups/deribit`）
+- `DATABASE_BACKUP_INTERVAL_MS`: バックアップ間隔 (ミリ秒) ※ デフォルト 86400000 (24時間)
 - その他の設定は`.env.example`を参照
 
 ### 4. ビルドと実行
@@ -109,11 +104,15 @@ cp .env.example .env
 # TypeScriptをコンパイル
 npm run build
 
-# アプリケーションを実行
-npm start
+# プロセスごとの起動例
+npm run start:ingest
+npm run start:aggregate
+npm run start:alert
 
-# 開発モード（TypeScriptを直接実行）
-npm run dev
+# 開発モード（ts-node 実行）
+npm run dev:ingest
+npm run dev:aggregate
+npm run dev:alert
 
 # PM2で常駐起動
 npm run start:pm2
@@ -152,8 +151,8 @@ COLLECT_DURATION_MS=60000 ENABLE_ALERTS=true npm run collect:sample
 
 ## 運用メモ
 
-- 常駐運用には [PM2](https://pm2.keymetrics.io/) の利用を想定しており、`ecosystem.config.js` を同梱しています。
-- `npm run start:pm2` / `npm run stop:pm2` でプロセスの起動・停止を行えます。
+- 常駐運用には [PM2](https://pm2.keymetrics.io/) の利用を想定しており、`ecosystem.config.js` に `deribit-ingest` / `deribit-aggregate` / `deribit-alert` の 3 アプリを定義しています。
+- `npm run start:pm2` / `npm run stop:pm2` で各プロセスの起動・削除をまとめて実行できます。
 - ログレベルは `.env` の `LOG_LEVEL` で制御でき、`debug` に設定すると詳細ログを出力します。
 
 ## プロジェクト構造

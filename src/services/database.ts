@@ -16,8 +16,11 @@ import {
   ExpiryType,
   DeltaBucket,
   OptionType,
+  TradeDataRow,
+  AlertQueueRecord,
 } from '../types';
-import { IDatabaseManager } from './interfaces';
+import { IDatabaseManager, ProcessingState } from './interfaces';
+import { CvdAlertPayload } from '@crypto-data/cvd-core';
 
 export class DatabaseManager implements IDatabaseManager {
   private db: sqlite3.Database | null = null;
@@ -50,6 +53,8 @@ export class DatabaseManager implements IDatabaseManager {
           // Create tables and indexes
           this.createTables()
             .then(() => this.ensureAnalyticsColumns())
+            .then(() => this.ensureTradeAugmentationColumns())
+            .then(() => this.ensureCvdDeltaColumns())
             .then(() => this.createIndexes())
             .then(() => {
               console.log('Database initialized successfully');
@@ -79,6 +84,11 @@ export class DatabaseManager implements IDatabaseManager {
         amount REAL NOT NULL,
         direction TEXT NOT NULL,
         trade_id TEXT UNIQUE NOT NULL,
+        channel TEXT,
+        mark_price REAL,
+        index_price REAL,
+        underlying_price REAL,
+        is_block_trade INTEGER NOT NULL DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )`,
       `CREATE TABLE IF NOT EXISTS option_data (
@@ -97,9 +107,12 @@ export class DatabaseManager implements IDatabaseManager {
       )`,
       `CREATE TABLE IF NOT EXISTS cvd_data (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
         timestamp INTEGER NOT NULL,
         cvd_value REAL NOT NULL,
         z_score REAL NOT NULL,
+        delta_value REAL NOT NULL DEFAULT 0,
+        delta_z_score REAL NOT NULL DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )`,
       `CREATE TABLE IF NOT EXISTS alert_history (
@@ -133,6 +146,24 @@ export class DatabaseManager implements IDatabaseManager {
         delta REAL NOT NULL,
         index_price REAL NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS processing_state (
+        process_name TEXT NOT NULL,
+        key TEXT NOT NULL,
+        last_row_id INTEGER NOT NULL DEFAULT 0,
+        last_timestamp INTEGER NOT NULL DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (process_name, key)
+      )`,
+      `CREATE TABLE IF NOT EXISTS alert_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        alert_type TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        processed_at INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )`
     ];
 
@@ -155,6 +186,57 @@ export class DatabaseManager implements IDatabaseManager {
     });
   }
 
+  private async ensureCvdDeltaColumns(): Promise<void> {
+    const db = this.getDatabase();
+    const columns = await new Promise<Array<{ name: string }>>((resolve, reject) => {
+      db.all('PRAGMA table_info(cvd_data)', [], (err, rows) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(rows as Array<{ name: string }>);
+        }
+      });
+    });
+
+    const columnNames = new Set(columns.map((row) => row.name));
+
+    if (!columnNames.has('delta_value')) {
+      await new Promise<void>((resolve, reject) => {
+        db.run('ALTER TABLE cvd_data ADD COLUMN delta_value REAL NOT NULL DEFAULT 0', (err) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
+      });
+    }
+
+    if (!columnNames.has('delta_z_score')) {
+      await new Promise<void>((resolve, reject) => {
+        db.run('ALTER TABLE cvd_data ADD COLUMN delta_z_score REAL NOT NULL DEFAULT 0', (err) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
+      });
+    }
+
+    if (!columnNames.has('symbol')) {
+      await new Promise<void>((resolve, reject) => {
+        db.run('ALTER TABLE cvd_data ADD COLUMN symbol TEXT', (err) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
+      });
+    }
+  }
+
   /**
    * Create database indexes for performance optimization
    */
@@ -164,6 +246,7 @@ export class DatabaseManager implements IDatabaseManager {
     const indexes = [
       'CREATE INDEX IF NOT EXISTS idx_trade_data_timestamp ON trade_data(timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_trade_data_symbol ON trade_data(symbol)',
+      'CREATE INDEX IF NOT EXISTS idx_trade_data_block ON trade_data(is_block_trade, timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_option_data_timestamp ON option_data(timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_option_data_symbol ON option_data(symbol)',
       'CREATE INDEX IF NOT EXISTS idx_cvd_data_timestamp ON cvd_data(timestamp)',
@@ -172,7 +255,9 @@ export class DatabaseManager implements IDatabaseManager {
       'CREATE INDEX IF NOT EXISTS idx_order_flow_ratio_timestamp ON order_flow_ratio(timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_order_flow_ratio_bucket ON order_flow_ratio(expiry_type, delta_bucket, option_type)',
       'CREATE INDEX IF NOT EXISTS idx_skew_raw_data_timestamp ON skew_raw_data(timestamp)',
-      'CREATE INDEX IF NOT EXISTS idx_skew_raw_data_bucket ON skew_raw_data(expiry_type, delta_bucket, option_type)'
+      'CREATE INDEX IF NOT EXISTS idx_skew_raw_data_bucket ON skew_raw_data(expiry_type, delta_bucket, option_type)',
+      'CREATE INDEX IF NOT EXISTS idx_processing_state_lookup ON processing_state(process_name, key)',
+      'CREATE INDEX IF NOT EXISTS idx_alert_queue_pending ON alert_queue(processed_at, id)'
     ];
 
     return new Promise((resolve, reject) => {
@@ -212,8 +297,8 @@ export class DatabaseManager implements IDatabaseManager {
 
     const insertSql = `
       INSERT OR IGNORE INTO trade_data 
-      (symbol, timestamp, price, amount, direction, trade_id)
-      VALUES (?, ?, ?, ?, ?, ?)
+      (symbol, timestamp, price, amount, direction, trade_id, channel, mark_price, index_price, underlying_price, is_block_trade)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
     return new Promise((resolve, reject) => {
@@ -236,7 +321,12 @@ export class DatabaseManager implements IDatabaseManager {
             trade.price,
             trade.amount,
             trade.direction,
-            trade.tradeId
+            trade.tradeId,
+            trade.channel ?? null,
+            typeof trade.markPrice === 'number' ? trade.markPrice : null,
+            typeof trade.indexPrice === 'number' ? trade.indexPrice : null,
+            typeof trade.underlyingPrice === 'number' ? trade.underlyingPrice : null,
+            trade.isBlockTrade ? 1 : 0
           ], (err) => {
             if (err && !hasError) {
               hasError = true;
@@ -354,6 +444,167 @@ export class DatabaseManager implements IDatabaseManager {
   }
 
   /**
+   * Get trade data rows since a specific rowId
+   */
+  async getTradeDataSinceRowId(lastRowId: number, limit: number): Promise<TradeDataRow[]> {
+    const db = this.getDatabase();
+
+    const selectSql = `
+      SELECT
+        rowid as rowId,
+        symbol,
+        timestamp,
+        price,
+        amount,
+        direction,
+        trade_id as tradeId,
+        channel,
+        mark_price as markPrice,
+        index_price as indexPrice,
+        underlying_price as underlyingPrice,
+        is_block_trade as isBlockTrade
+      FROM trade_data
+      WHERE rowid > ?
+      ORDER BY rowid ASC
+      LIMIT ?
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.all(selectSql, [lastRowId, Math.max(1, Math.floor(limit))], (err, rows) => {
+        if (err) {
+          console.error('Failed to get trade data since rowId:', err);
+          reject(err);
+        } else {
+          const mapped = (rows as Array<Record<string, unknown>>).map((row) => this.mapTradeRow(row));
+          resolve(mapped);
+        }
+      });
+    });
+  }
+
+  /**
+   * Get large trade candidates since a specific rowId
+   */
+  async getLargeTradeDataSinceRowId(lastRowId: number, limit: number, minAmount: number): Promise<TradeDataRow[]> {
+    const db = this.getDatabase();
+
+    const selectSql = `
+      SELECT
+        rowid as rowId,
+        symbol,
+        timestamp,
+        price,
+        amount,
+        direction,
+        trade_id as tradeId,
+        channel,
+        mark_price as markPrice,
+        index_price as indexPrice,
+        underlying_price as underlyingPrice,
+        is_block_trade as isBlockTrade
+      FROM trade_data
+      WHERE rowid > ?
+        AND amount >= ?
+      ORDER BY rowid ASC
+      LIMIT ?
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.all(selectSql, [lastRowId, minAmount, Math.max(1, Math.floor(limit))], (err, rows) => {
+        if (err) {
+          console.error('Failed to get large trade data:', err);
+          reject(err);
+        } else {
+          const mapped = (rows as Array<Record<string, unknown>>).map((row) => this.mapTradeRow(row));
+          resolve(mapped);
+        }
+      });
+    });
+  }
+
+  /**
+   * Get latest trade cursor (rowId / timestamp)
+   */
+  async getLatestTradeCursor(symbol?: string): Promise<{ rowId: number; timestamp: number } | null> {
+    const db = this.getDatabase();
+
+    const selectSql = symbol
+      ? `
+        SELECT rowid as rowId, timestamp
+        FROM trade_data
+        WHERE symbol = ?
+        ORDER BY rowid DESC
+        LIMIT 1
+      `
+      : `
+        SELECT rowid as rowId, timestamp
+        FROM trade_data
+        ORDER BY rowid DESC
+        LIMIT 1
+      `;
+
+    const params = symbol ? [symbol] : [];
+
+    return new Promise((resolve, reject) => {
+      db.get(selectSql, params, (err, row: { rowId?: number; timestamp?: number } | undefined) => {
+        if (err) {
+          console.error('Failed to fetch latest trade cursor:', err);
+          reject(err);
+        } else if (!row) {
+          resolve(null);
+        } else {
+          resolve({
+            rowId: Number(row.rowId ?? 0),
+            timestamp: Number(row.timestamp ?? 0),
+          });
+        }
+      });
+    });
+  }
+
+  /**
+   * Normalize SQLite row into TradeDataRow object
+   */
+  private mapTradeRow(row: Record<string, unknown>): TradeDataRow {
+    const trade: TradeDataRow = {
+      rowId: Number(row['rowId'] ?? 0),
+      symbol: String(row['symbol'] ?? ''),
+      timestamp: Number(row['timestamp'] ?? 0),
+      price: Number(row['price'] ?? 0),
+      amount: Number(row['amount'] ?? 0),
+      direction: (row['direction'] as 'buy' | 'sell') ?? 'buy',
+      tradeId: String(row['tradeId'] ?? ''),
+    };
+
+    const channel = row['channel'];
+    if (channel !== undefined && channel !== null) {
+      trade.channel = String(channel);
+    }
+
+    const markPrice = row['markPrice'];
+    if (markPrice !== undefined && markPrice !== null) {
+      trade.markPrice = Number(markPrice);
+    }
+
+    const indexPrice = row['indexPrice'];
+    if (indexPrice !== undefined && indexPrice !== null) {
+      trade.indexPrice = Number(indexPrice);
+    }
+
+    const underlyingPrice = row['underlyingPrice'];
+    if (underlyingPrice !== undefined && underlyingPrice !== null) {
+      trade.underlyingPrice = Number(underlyingPrice);
+    }
+
+    const isBlock = Number(row['isBlockTrade'] ?? 0) === 1;
+    if (isBlock) {
+      trade.isBlockTrade = true;
+    }
+
+    return trade;
+  }
+
+  /**
    * Get the latest option data
    */
   async getLatestOptionData(): Promise<OptionData[]> {
@@ -397,15 +648,18 @@ export class DatabaseManager implements IDatabaseManager {
     const db = this.getDatabase();
 
     const insertSql = `
-      INSERT INTO cvd_data (timestamp, cvd_value, z_score)
-      VALUES (?, ?, ?)
+      INSERT INTO cvd_data (symbol, timestamp, cvd_value, z_score, delta_value, delta_z_score)
+      VALUES (?, ?, ?, ?, ?, ?)
     `;
 
     return new Promise((resolve, reject) => {
-      db.run(insertSql, [
-        data.timestamp,
-        data.cvdValue,
-        data.zScore
+        db.run(insertSql, [
+          data.symbol,
+          data.timestamp,
+          data.cvdValue,
+          data.zScore,
+          data.delta ?? 0,
+          data.deltaZScore ?? 0
       ], (err) => {
         if (err) {
           console.error('Failed to save CVD data:', err);
@@ -420,22 +674,26 @@ export class DatabaseManager implements IDatabaseManager {
   /**
    * Get CVD data for Z-score calculation (last 24 hours)
    */
-  async getCVDDataLast24Hours(): Promise<CVDData[]> {
+  async getCVDDataLast24Hours(symbol: string): Promise<CVDData[]> {
     const db = this.getDatabase();
     const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
     
     const selectSql = `
       SELECT 
+        symbol as symbol,
         timestamp, 
         cvd_value as cvdValue, 
-        z_score as zScore
+        z_score as zScore,
+        delta_value as delta,
+        delta_z_score as deltaZScore
       FROM cvd_data 
-      WHERE timestamp >= ?
+      WHERE symbol = ?
+        AND timestamp >= ?
       ORDER BY timestamp ASC
     `;
 
     return new Promise((resolve, reject) => {
-      db.all(selectSql, [twentyFourHoursAgo], (err, rows) => {
+      db.all(selectSql, [symbol, twentyFourHoursAgo], (err, rows) => {
         if (err) {
           console.error('Failed to get CVD data:', err);
           reject(err);
@@ -449,21 +707,25 @@ export class DatabaseManager implements IDatabaseManager {
   /**
    * Get CVD data from a specific timestamp
    */
-  async getCVDDataSince(since: number): Promise<CVDData[]> {
+  async getCVDDataSince(symbol: string, since: number): Promise<CVDData[]> {
     const db = this.getDatabase();
 
     const selectSql = `
       SELECT 
+        symbol as symbol,
         timestamp,
         cvd_value as cvdValue,
-        z_score as zScore
+        z_score as zScore,
+        delta_value as delta,
+        delta_z_score as deltaZScore
       FROM cvd_data
-      WHERE timestamp >= ?
+      WHERE symbol = ?
+        AND timestamp >= ?
       ORDER BY timestamp ASC
     `;
 
     return new Promise((resolve, reject) => {
-      db.all(selectSql, [since], (err, rows) => {
+      db.all(selectSql, [symbol, since], (err, rows) => {
         if (err) {
           console.error('Failed to get CVD data since timestamp:', err);
           reject(err);
@@ -537,11 +799,299 @@ export class DatabaseManager implements IDatabaseManager {
   }
 
   /**
+   * Retrieve saved processing state for a worker
+   */
+  async getProcessingState(processName: string, key: string): Promise<ProcessingState | null> {
+    const db = this.getDatabase();
+
+    const selectSql = `
+      SELECT
+        last_row_id as lastRowId,
+        last_timestamp as lastTimestamp
+      FROM processing_state
+      WHERE process_name = ?
+        AND key = ?
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.get(selectSql, [processName, key], (err, row: { lastRowId?: number; lastTimestamp?: number } | undefined) => {
+        if (err) {
+          console.error('Failed to load processing state:', err);
+          reject(err);
+        } else if (!row) {
+          resolve(null);
+        } else {
+          resolve({
+            lastRowId: Number(row.lastRowId ?? 0),
+            lastTimestamp: Number(row.lastTimestamp ?? 0),
+          });
+        }
+      });
+    });
+  }
+
+  /**
+   * Persist worker processing state
+   */
+  async saveProcessingState(processName: string, key: string, state: ProcessingState): Promise<void> {
+    const db = this.getDatabase();
+
+    const upsertSql = `
+      INSERT INTO processing_state (process_name, key, last_row_id, last_timestamp, updated_at)
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(process_name, key)
+      DO UPDATE SET
+        last_row_id = excluded.last_row_id,
+        last_timestamp = excluded.last_timestamp,
+        updated_at = CURRENT_TIMESTAMP
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.run(upsertSql, [processName, key, state.lastRowId, state.lastTimestamp], (err) => {
+        if (err) {
+          console.error('Failed to save processing state:', err);
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  /**
+   * Enqueue alert payload for asynchronous dispatch
+   */
+  async enqueueAlert(alertType: string, payload: CvdAlertPayload, timestamp: number): Promise<number> {
+    const db = this.getDatabase();
+
+    const insertSql = `
+      INSERT INTO alert_queue (alert_type, timestamp, payload_json)
+      VALUES (?, ?, ?)
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.run(insertSql, [alertType, timestamp, JSON.stringify(payload)], function (err) {
+        if (err) {
+          console.error('Failed to enqueue alert payload:', err);
+          reject(err);
+        } else {
+          resolve(Number(this.lastID));
+        }
+      });
+    });
+  }
+
+  /**
+   * Retrieve pending alerts from queue
+   */
+  async getPendingAlerts(limit: number): Promise<AlertQueueRecord[]> {
+    const db = this.getDatabase();
+
+    const selectSql = `
+      SELECT
+        id,
+        alert_type as alertType,
+        timestamp,
+        payload_json as payloadJson,
+        attempt_count as attemptCount,
+        last_error as lastError,
+        processed_at as processedAt,
+        created_at as createdAt
+      FROM alert_queue
+      WHERE processed_at IS NULL
+      ORDER BY timestamp ASC, id ASC
+      LIMIT ?
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.all(selectSql, [Math.max(1, Math.floor(limit))], (err, rows) => {
+        if (err) {
+          console.error('Failed to load pending alerts:', err);
+          reject(err);
+        } else {
+          const mapped: AlertQueueRecord[] = (rows as Array<Record<string, unknown>>).map((row) => {
+            const record: AlertQueueRecord = {
+              id: Number(row['id']),
+              alertType: String(row['alertType'] ?? ''),
+              timestamp: Number(row['timestamp'] ?? 0),
+              payload: JSON.parse(String(row['payloadJson'] ?? '{}')) as CvdAlertPayload,
+              attemptCount: Number(row['attemptCount'] ?? 0),
+            };
+
+            if (row['lastError'] !== undefined && row['lastError'] !== null) {
+              record.lastError = String(row['lastError']);
+            }
+
+            if (row['processedAt'] !== undefined && row['processedAt'] !== null) {
+              record.processedAt = Number(row['processedAt']);
+            }
+
+            if (row['createdAt'] !== undefined && row['createdAt'] !== null) {
+              record.createdAt = Number(new Date(String(row['createdAt'])).getTime());
+            }
+
+            return record;
+          });
+          resolve(mapped);
+        }
+      });
+    });
+  }
+
+  /**
+   * Mark alert queue record processed successfully
+   */
+  async markAlertProcessed(id: number): Promise<void> {
+    const db = this.getDatabase();
+
+    const updateSql = `
+      UPDATE alert_queue
+      SET processed_at = ?
+      WHERE id = ?
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.run(updateSql, [Date.now(), id], (err) => {
+        if (err) {
+          console.error('Failed to mark alert as processed:', err);
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  /**
+   * Record alert processing failure
+   */
+  async markAlertFailed(id: number, error: Error): Promise<void> {
+    const db = this.getDatabase();
+
+    const updateSql = `
+      UPDATE alert_queue
+      SET attempt_count = attempt_count + 1,
+          last_error = ?,
+          processed_at = NULL
+      WHERE id = ?
+    `;
+
+    return new Promise((resolve, reject) => {
+      db.run(updateSql, [error.message, id], (err) => {
+        if (err) {
+          console.error('Failed to update alert failure state:', err);
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  /**
+   * Determine if recent alerts or pending items exist for suppression
+   */
+  async hasRecentAlertOrPending(alertType: string, cutoffTimestamp: number): Promise<boolean> {
+    const db = this.getDatabase();
+
+    const alertPromise = new Promise<boolean>((resolve, reject) => {
+      db.get(
+        `
+          SELECT 1
+          FROM alert_history
+          WHERE alert_type = ?
+            AND timestamp >= ?
+          LIMIT 1
+        `,
+        [alertType, cutoffTimestamp],
+        (err, row) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(!!row);
+          }
+        }
+      );
+    });
+
+    const queuePromise = new Promise<boolean>((resolve, reject) => {
+      db.get(
+        `
+          SELECT 1
+          FROM alert_queue
+          WHERE alert_type = ?
+            AND processed_at IS NULL
+            AND timestamp >= ?
+          LIMIT 1
+        `,
+        [alertType, cutoffTimestamp],
+        (err, row) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(!!row);
+          }
+        }
+      );
+    });
+
+    try {
+      const [hasAlert, hasPending] = await Promise.all([alertPromise, queuePromise]);
+      return hasAlert || hasPending;
+    } catch (error) {
+      console.error('Failed to evaluate alert suppression state:', error);
+      return false;
+    }
+  }
+
+  async pruneOlderThan(cutoffTimestamp: number): Promise<void> {
+    const db = this.getDatabase();
+    const run = (sql: string, params: unknown[] = []): Promise<void> =>
+      new Promise((resolve, reject) => {
+        db.run(sql, params, (err) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
+      });
+
+    const statements: Array<{ sql: string; params: unknown[] }> = [
+      { sql: 'DELETE FROM trade_data WHERE timestamp < ?', params: [cutoffTimestamp] },
+      { sql: 'DELETE FROM option_data WHERE timestamp < ?', params: [cutoffTimestamp] },
+      { sql: 'DELETE FROM cvd_data WHERE timestamp < ?', params: [cutoffTimestamp] },
+      { sql: 'DELETE FROM alert_history WHERE timestamp < ?', params: [cutoffTimestamp] },
+      { sql: 'DELETE FROM order_flow_ratio WHERE timestamp < ?', params: [cutoffTimestamp] },
+      { sql: 'DELETE FROM skew_raw_data WHERE timestamp < ?', params: [cutoffTimestamp] },
+      {
+        sql: 'DELETE FROM alert_queue WHERE processed_at IS NOT NULL AND timestamp < ?',
+        params: [cutoffTimestamp],
+      },
+    ];
+
+    for (const { sql, params } of statements) {
+      await run(sql, params);
+    }
+  }
+
+  /**
    * Ensure new analytics columns exist on legacy databases
    */
   private async ensureAnalyticsColumns(): Promise<void> {
     await this.addColumnIfMissing('order_flow_ratio', 'expiry_timestamp', 'INTEGER');
     await this.addColumnIfMissing('skew_raw_data', 'expiry_timestamp', 'INTEGER');
+  }
+
+  /**
+   * Ensure trade table contains optional metadata columns
+   */
+  private async ensureTradeAugmentationColumns(): Promise<void> {
+    await this.addColumnIfMissing('trade_data', 'channel', 'TEXT');
+    await this.addColumnIfMissing('trade_data', 'mark_price', 'REAL');
+    await this.addColumnIfMissing('trade_data', 'index_price', 'REAL');
+    await this.addColumnIfMissing('trade_data', 'underlying_price', 'REAL');
+    await this.addColumnIfMissing('trade_data', 'is_block_trade', 'INTEGER NOT NULL DEFAULT 0');
   }
 
   /**
@@ -655,7 +1205,7 @@ export class DatabaseManager implements IDatabaseManager {
         delta,
         index_price
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
     return new Promise((resolve, reject) => {

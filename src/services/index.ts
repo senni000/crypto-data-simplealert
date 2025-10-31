@@ -12,6 +12,8 @@ export { DataHealthMonitor } from './data-health-monitor';
 export { DatabaseBackupScheduler } from './database-backup-scheduler';
 export { SkewChartReporter } from './skew-chart-reporter';
 export { AnalyticsAlertProcessor } from './analytics-alert-processor';
+export { CvdAggregationWorker } from './cvd-aggregation-worker';
+export { AlertQueueProcessor } from './alert-queue-processor';
 export { 
   CVDCalculator, 
   ZScoreCalculator, 

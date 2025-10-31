@@ -177,13 +177,14 @@ describe('DeribitWebSocketClient', () => {
 
       client.once('tradeData', (trades) => {
         expect(trades).toHaveLength(1);
-        expect(trades[0]).toMatchObject({
+        const trade = trades[0];
+        expect(trade).toMatchObject({
           symbol: 'BTC-PERPETUAL',
           price: 45000,
-          amount: 0.1,
           direction: 'buy',
-          tradeId: 'test_trade_1'
+          tradeId: 'test_trade_1',
         });
+        expect(trade?.amount ?? 0).toBeCloseTo(0.1 / 45000, 10);
         done();
       });
 

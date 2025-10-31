@@ -13,8 +13,11 @@ import {
   ExpiryType,
   DeltaBucket,
   OptionType,
+  TradeDataRow,
+  AlertQueueRecord,
 } from '../types';
 import { LogLevel } from '../types/config';
+import { CvdAlertPayload } from '@crypto-data/cvd-core';
 
 /**
  * Application configuration structure
@@ -25,15 +28,33 @@ export interface AppConfig {
   deribitApiUrl: string;
   optionDataInterval: number;
   cvdZScoreThreshold: number;
+  cvdAggregationSymbol: string;
+  cvdAggregationTradeSymbols: string[];
+  cvdAggregationBatchSize: number;
+  cvdAggregationPollIntervalMs: number;
+  cvdAlertSuppressionMinutes: number;
+  alertQueuePollIntervalMs: number;
+  alertQueueBatchSize: number;
+  alertQueueMaxAttempts: number;
+  alertOptionPollIntervalMs: number;
+  analyticsAlertIntervalMs: number;
+  blockTradePollIntervalMs: number;
+  blockTradeAmountThreshold: number;
   logLevel: LogLevel;
   databaseBackupEnabled: boolean;
-  databaseBackupPath: string;
-  databaseBackupInterval: number;
-  databaseBackupRetentionDays: number;
+  databaseBackupDirectory: string;
+  databaseBackupIntervalMs: number;
+  databaseRetentionMs: number | null;
   analyticsEnabled: boolean;
   analyticsIntervalMs: number;
   analyticsInstrumentRefreshIntervalMs: number;
   analyticsRatioWindowUsd: number;
+  enableCvdAlerts: boolean;
+}
+
+export interface ProcessingState {
+  lastRowId: number;
+  lastTimestamp: number;
 }
 
 /**
@@ -64,12 +85,7 @@ export interface IAlertManager {
    * Check C-P Delta 25 moving average conditions and send alerts
    */
   checkCPDelta25Alert(optionData: OptionData[]): Promise<void>;
-  
-  /**
-   * Check CVD Z-score conditions and send alerts
-   */
-  checkCVDAlert(tradeData: TradeData[]): Promise<void>;
-  
+
   /**
    * Send alert message to Discord webhook
    */
@@ -84,6 +100,11 @@ export interface IAlertManager {
    * Send chart image or other attachments to Discord
    */
   sendDiscordImage(options: { buffer: Buffer; filename: string; content?: string }): Promise<void>;
+
+  /**
+   * Dispatch formatted CVD alert payload
+   */
+  sendCvdAlertPayload(payload: CvdAlertPayload): Promise<void>;
 }
 
 /**
@@ -119,16 +140,31 @@ export interface IDatabaseManager {
    * Save CVD calculation results
    */
   saveCVDData(data: CVDData): Promise<void>;
+
+  /**
+   * Retrieve raw trades since specific row id
+   */
+  getTradeDataSinceRowId(lastRowId: number, limit: number): Promise<TradeDataRow[]>;
+
+  /**
+   * Get latest trade cursor (rowId / timestamp)
+   */
+  getLatestTradeCursor(symbol?: string): Promise<{ rowId: number; timestamp: number } | null>;
+
+  /**
+   * Retrieve candidate large trades since specific row id
+   */
+  getLargeTradeDataSinceRowId(lastRowId: number, limit: number, minAmount: number): Promise<TradeDataRow[]>;
   
   /**
    * Get CVD data for Z-score calculation
    */
-  getCVDDataLast24Hours(): Promise<CVDData[]>;
+  getCVDDataLast24Hours(symbol: string): Promise<CVDData[]>;
 
   /**
    * Get CVD data from a specific timestamp
    */
-  getCVDDataSince(since: number): Promise<CVDData[]>;
+  getCVDDataSince(symbol: string, since: number): Promise<CVDData[]>;
 
   /**
    * Save alert history entry
@@ -171,6 +207,51 @@ export interface IDatabaseManager {
     since?: number;
     limit?: number;
   }): Promise<SkewRawData[]>;
+
+  /**
+   * Load persisted processing cursor
+   */
+  getProcessingState(processName: string, key: string): Promise<ProcessingState | null>;
+
+  /**
+   * Persist processing cursor
+   */
+  saveProcessingState(processName: string, key: string, state: ProcessingState): Promise<void>;
+
+  /**
+   * Enqueue alert payload for asynchronous delivery
+   */
+  enqueueAlert(alertType: string, payload: CvdAlertPayload, timestamp: number): Promise<number>;
+
+  /**
+   * Load pending alert queue records
+   */
+  getPendingAlerts(limit: number): Promise<AlertQueueRecord[]>;
+
+  /**
+   * Mark alert queue record delivered
+   */
+  markAlertProcessed(id: number): Promise<void>;
+
+  /**
+   * Mark alert queue record failed (retryable)
+   */
+  markAlertFailed(id: number, error: Error): Promise<void>;
+
+  /**
+   * Check recent alerts or pending queue entries for suppression logic
+   */
+  hasRecentAlertOrPending(alertType: string, cutoffTimestamp: number): Promise<boolean>;
+
+  /**
+   * Remove records older than the specified cutoff
+   */
+  pruneOlderThan(cutoffTimestamp: number): Promise<void>;
+
+  /**
+   * Close database connection
+   */
+  closeDatabase(): Promise<void>;
 }
 
 /**
