@@ -32,7 +32,8 @@
 - 取得頻度は `.env` の `OPTION_DATA_INTERVAL`（既定 1 時間）で制御され、エラーは指数バックオフ付きでリトライします。
 
 #### 派生指標の蓄積
-- `CvdAggregationWorker` が共有ライブラリ `@crypto-data/cvd-core` の累積 CVD アグリゲータを用いて `trade_data` の新規レコードを巡回し、`cvd_data` テーブルへ Z スコア付きで追記します（直近 24 時間分を参照）。閾値超過時は `alert_queue` に `CVD_ZSCORE` ペイロードを enqueue します。
+- `CvdAggregationWorker` が `trade_data` を巡回し、5 分・30 分バケットそれぞれについて直近 72 時間の差分出来高（デルタ）を集計し、Z スコアを求めて `cvd_data` テーブルへ保存します。閾値超過時は `alert_queue` に `CVD_DELTA_{SPAN}M_{BUY/SELL}` ペイロードを enqueue します。
+- 同時に個々の成行約定サイズを 72 時間分追跡し、分布の上位分位（既定 99%）を超えた起点トレードを `MARKET_TRADE_START_{BUY/SELL}` として enqueue します。
 - `AlertManager.checkCPDelta25Alert` が `CPDelta25Calculator` でデルタが +0.25/-0.25 に最も近いコール・プットを選び、`MovingAverageMonitor`（期間 10）に値を渡して移動平均系列を維持します。
 
 ### アラートの種類
@@ -40,8 +41,16 @@
   - 同じ 1 分足、または Skew 発生後 2 分以内に Ratio も条件を満たした場合に複合アラートを送信。  
   - 「CALL Skew Spike + Bid dominance」などのメッセージを出力。
 
-- **CVD_ZSCORE（テキスト）**  
-  - `CvdAggregationWorker` が enqueue したペイロードを `AlertQueueProcessor` がポーリングし、Discord へ送信します。閾値（既定 2.0）とサプレッションウィンドウ（既定 30 分）を満たす場合のみ配送されます。  
+- **CVD_DELTA（テキスト）**  
+  - `CvdAggregationWorker` が enqueue したペイロードを `AlertQueueProcessor` がポーリングし、Discord へ送信します。5 分・30 分バケットそれぞれで Z スコアが既定閾値（`.env` の `CVD_ZSCORE_THRESHOLD`、既定 2.0）を超過した方向（買い／売り）を通知します。  
+  - 配送完了後に `alert_history` にアラート種別・値・閾値・メッセージを記録します。
+
+- **MARKET_TRADE_START（テキスト）**  
+  - 72 時間分の市場成行約定サイズから求めた上位分位（既定 99%）を超える起点トレードを検出し、Trade ID や分位値を含むメッセージを送信します。  
+  - 配送完了後に `alert_history` にアラート種別・値・閾値・メッセージを記録します。
+
+- **CVD_SLOPE（テキスト）**  
+  - 5 分・30 分バケットの差分出来高を EMA で滑らかにし、傾きがロバスト Z スコアで既定値（`.env` の `CVD_SLOPE_THRESHOLD`）を超え、かつ直近に起点トレードがある場合に通知します。  
   - 配送完了後に `alert_history` にアラート種別・値・閾値・メッセージを記録します。
 
 - **CP_DELTA_25（テキスト）**  

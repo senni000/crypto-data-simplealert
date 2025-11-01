@@ -1,7 +1,14 @@
 import { AlertManager } from '../alert-manager';
 import { IDatabaseManager } from '../interfaces';
-import { OptionData, TradeData, AlertMessage, CVDData, AlertHistory } from '../../types';
-import { CvdAlertPayload } from '@crypto-data/cvd-core';
+import {
+  OptionData,
+  TradeData,
+  AlertMessage,
+  CVDData,
+  AlertHistory,
+  CvdDeltaAlertPayload,
+  MarketTradeSpikePayload,
+} from '../../types';
 
 type MockedDatabaseManager = jest.Mocked<IDatabaseManager>;
 
@@ -13,7 +20,7 @@ const createMockDatabaseManager = (): MockedDatabaseManager => ({
   getLatestOptionData: jest.fn().mockResolvedValue([]),
   saveCVDData: jest.fn().mockResolvedValue(undefined),
   getCVDDataLast24Hours: jest.fn().mockResolvedValue([] as CVDData[]),
-  getCVDDataSince: jest.fn().mockResolvedValue([] as CVDData[]),
+  getCvdDataSince: jest.fn().mockResolvedValue([] as CVDData[]),
   saveAlertHistory: jest.fn().mockResolvedValue(undefined),
   getRecentAlerts: jest.fn().mockResolvedValue([]),
   saveOrderFlowRatioData: jest.fn().mockResolvedValue(undefined),
@@ -89,7 +96,7 @@ describe('AlertManager', () => {
       });
 
       const message: AlertMessage = {
-        type: 'CVD_ZSCORE',
+        type: 'CVD_DELTA',
         timestamp: Date.now(),
         value: 2.5,
         threshold: 2.0,
@@ -217,16 +224,15 @@ describe('AlertManager', () => {
   });
 
   describe('sendCvdAlertPayload', () => {
-    const payload: CvdAlertPayload = {
+    const payload: CvdDeltaAlertPayload = {
       symbol: 'BTC-PERP',
       timestamp: Date.now(),
-      triggerSource: 'cumulative',
-      triggerZScore: 3.2,
+      bucketSpanMinutes: 5,
+      delta: 1500,
       zScore: 3.2,
-      delta: 1.4,
-      deltaZScore: 2.0,
       threshold: 2.5,
-      cumulativeValue: 25,
+      direction: 'buy',
+      windowHours: 72,
     };
 
     it('sends formatted payload to Discord and records history', async () => {
@@ -243,7 +249,7 @@ describe('AlertManager', () => {
       expect(httpClient.post).toHaveBeenCalledTimes(1);
       expect(db.saveAlertHistory).toHaveBeenCalledWith(
         expect.objectContaining({
-          alertType: 'CVD_ZSCORE',
+          alertType: 'CVD_DELTA_5M_BUY',
           threshold: payload.threshold,
         }),
       );
@@ -260,6 +266,55 @@ describe('AlertManager', () => {
       });
 
       await expect(manager.sendCvdAlertPayload(payload)).rejects.toThrow('discord down');
+      expect(db.saveAlertHistory).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('sendMarketTradeStartAlert', () => {
+    const payload: MarketTradeStartPayload = {
+      symbol: 'BTC-PERP',
+      timestamp: Date.now(),
+      tradeId: 'trade-123',
+      direction: 'buy',
+      amount: 15000,
+      quantile: 12000,
+      quantileLevel: 0.99,
+      secondaryQuantile: 9000,
+      threshold: 12000,
+      windowHours: 72,
+    };
+
+    it('sends formatted payload to Discord and records history', async () => {
+      const db = createMockDatabaseManager();
+      const httpClient = { post: jest.fn().mockResolvedValue({ status: 204 }) };
+
+      const manager = new AlertManager(db, {
+        webhookUrl,
+        httpClient,
+      });
+
+      await manager.sendMarketTradeStartAlert(payload);
+
+      expect(httpClient.post).toHaveBeenCalledTimes(1);
+      expect(db.saveAlertHistory).toHaveBeenCalledWith(
+        expect.objectContaining({
+          alertType: 'MARKET_TRADE_START_BUY',
+          threshold: payload.threshold,
+        }),
+      );
+    });
+
+    it('propagates errors from Discord delivery', async () => {
+      const db = createMockDatabaseManager();
+      const httpClient = { post: jest.fn().mockRejectedValue(new Error('discord down')) };
+
+      const manager = new AlertManager(db, {
+        webhookUrl,
+        httpClient,
+        maxRetries: 0,
+      });
+
+      await expect(manager.sendMarketTradeStartAlert(payload)).rejects.toThrow('discord down');
       expect(db.saveAlertHistory).not.toHaveBeenCalled();
     });
   });

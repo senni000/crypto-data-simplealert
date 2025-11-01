@@ -1,5 +1,3 @@
-import { CvdAlertPayload } from '@crypto-data/cvd-core';
-
 /**
  * Core data types for the Crypto Data Alert System
  */
@@ -52,7 +50,9 @@ export interface SkewRawData {
 export interface AlertMessage {
   type:
     | 'CP_DELTA_25'
-    | 'CVD_ZSCORE'
+    | 'CVD_DELTA'
+    | 'MARKET_TRADE_START'
+    | 'CVD_SLOPE'
     | 'COMBO_CALL'
     | 'COMBO_PUT';
   timestamp: number;
@@ -109,6 +109,7 @@ export interface CVDData {
   zScore: number;
   delta: number;
   deltaZScore: number;
+  bucketSpanMinutes: number;
 }
 
 /**
@@ -128,9 +129,51 @@ export interface AlertQueueRecord {
   id: number;
   alertType: string;
   timestamp: number;
-  payload: CvdAlertPayload;
+  payload: QueuedAlertPayload;
   attemptCount: number;
   lastError?: string | null;
   processedAt?: number | null;
   createdAt?: number;
 }
+
+export interface CvdDeltaAlertPayload {
+  symbol: string;
+  timestamp: number;
+  bucketSpanMinutes: number;
+  delta: number;
+  zScore: number;
+  threshold: number;
+  direction: 'buy' | 'sell';
+  windowHours: number;
+}
+
+export interface MarketTradeStartPayload {
+  symbol: string;
+  timestamp: number;
+  tradeId: string;
+  direction: 'buy' | 'sell';
+  amount: number;
+  quantile: number;
+  quantileLevel: number;
+  secondaryQuantile?: number;
+  scale?: number;
+  threshold: number;
+  windowHours: number;
+}
+
+export interface CvdSlopeAlertPayload {
+  symbol: string;
+  timestamp: number;
+  bucketSpanMinutes: number;
+  delta: number;
+  slope: number;
+  slopeZ: number;
+  threshold: number;
+  direction: 'buy' | 'sell';
+  windowHours: number;
+}
+
+export type QueuedAlertPayload =
+  | CvdDeltaAlertPayload
+  | MarketTradeStartPayload
+  | CvdSlopeAlertPayload;

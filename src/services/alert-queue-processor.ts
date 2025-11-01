@@ -1,7 +1,12 @@
 import { EventEmitter } from 'events';
 import { IDatabaseManager } from './interfaces';
 import { AlertManager } from './alert-manager';
-import { AlertQueueRecord } from '../types';
+import {
+  AlertQueueRecord,
+  CvdDeltaAlertPayload,
+  MarketTradeStartPayload,
+  CvdSlopeAlertPayload,
+} from '../types';
 import { logger } from '../utils/logger';
 
 export interface AlertQueueProcessorOptions {
@@ -105,16 +110,17 @@ export class AlertQueueProcessor extends EventEmitter {
 
   private async handleRecord(record: AlertQueueRecord): Promise<void> {
     try {
-      switch (record.alertType) {
-        case 'CVD_ZSCORE':
-          await this.alertManager.sendCvdAlertPayload(record.payload);
-          break;
-        default:
-          logger.warn('Unknown alert type in queue; marking as processed', {
-            alertId: record.id,
-            alertType: record.alertType,
-          });
-          break;
+      if (record.alertType.startsWith('CVD_DELTA_')) {
+        await this.alertManager.sendCvdAlertPayload(record.payload as CvdDeltaAlertPayload);
+      } else if (record.alertType.startsWith('MARKET_TRADE_START')) {
+        await this.alertManager.sendMarketTradeStartAlert(record.payload as MarketTradeStartPayload);
+      } else if (record.alertType.startsWith('CVD_SLOPE_')) {
+        await this.alertManager.sendCvdSlopeAlert(record.payload as CvdSlopeAlertPayload);
+      } else {
+        logger.warn('Unknown alert type in queue; marking as processed', {
+          alertId: record.id,
+          alertType: record.alertType,
+        });
       }
       await this.databaseManager.markAlertProcessed(record.id);
       this.emit('alertSent', record);

@@ -15,9 +15,12 @@ import {
   OptionType,
   TradeDataRow,
   AlertQueueRecord,
+  CvdDeltaAlertPayload,
+  MarketTradeStartPayload,
+  CvdSlopeAlertPayload,
+  QueuedAlertPayload,
 } from '../types';
 import { LogLevel } from '../types/config';
-import { CvdAlertPayload } from '@crypto-data/cvd-core';
 
 /**
  * Application configuration structure
@@ -50,6 +53,14 @@ export interface AppConfig {
   analyticsInstrumentRefreshIntervalMs: number;
   analyticsRatioWindowUsd: number;
   enableCvdAlerts: boolean;
+  marketTradeWindowHours: number;
+  marketTradePrimaryQuantile: number;
+  marketTradeSecondaryQuantile: number;
+  marketTradeMinSamples: number;
+  marketTradeLinkMinutes: number;
+  cvdSlopeThreshold: number;
+  cvdSlopeEmaAlpha: number;
+  cvdSlopeWindowHours: number;
 }
 
 export interface ProcessingState {
@@ -104,7 +115,17 @@ export interface IAlertManager {
   /**
    * Dispatch formatted CVD alert payload
    */
-  sendCvdAlertPayload(payload: CvdAlertPayload): Promise<void>;
+  sendCvdAlertPayload(payload: CvdDeltaAlertPayload): Promise<void>;
+
+  /**
+   * Dispatch market trade start alert payload
+   */
+  sendMarketTradeStartAlert(payload: MarketTradeStartPayload): Promise<void>;
+
+  /**
+   * Dispatch CVD slope alert payload
+   */
+  sendCvdSlopeAlert(payload: CvdSlopeAlertPayload): Promise<void>;
 }
 
 /**
@@ -157,14 +178,14 @@ export interface IDatabaseManager {
   getLargeTradeDataSinceRowId(lastRowId: number, limit: number, minAmount: number): Promise<TradeDataRow[]>;
   
   /**
-   * Get CVD data for Z-score calculation
+   * Get CVD data for last 24 hours (5分バケット互換API)
    */
   getCVDDataLast24Hours(symbol: string): Promise<CVDData[]>;
 
   /**
-   * Get CVD data from a specific timestamp
+   * Get CVD delta data from a specific timestamp for a bucket
    */
-  getCVDDataSince(symbol: string, since: number): Promise<CVDData[]>;
+  getCvdDataSince(symbol: string, bucketSpanMinutes: number, since: number): Promise<CVDData[]>;
 
   /**
    * Save alert history entry
@@ -221,7 +242,7 @@ export interface IDatabaseManager {
   /**
    * Enqueue alert payload for asynchronous delivery
    */
-  enqueueAlert(alertType: string, payload: CvdAlertPayload, timestamp: number): Promise<number>;
+  enqueueAlert(alertType: string, payload: QueuedAlertPayload, timestamp: number): Promise<number>;
 
   /**
    * Load pending alert queue records

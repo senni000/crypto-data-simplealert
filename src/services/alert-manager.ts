@@ -6,10 +6,16 @@
 import { EventEmitter } from 'events';
 import axios, { AxiosResponse } from 'axios';
 import FormData from 'form-data';
-import { OptionData, TradeData, AlertMessage } from '../types';
+import {
+  OptionData,
+  TradeData,
+  AlertMessage,
+  CvdDeltaAlertPayload,
+  MarketTradeStartPayload,
+  CvdSlopeAlertPayload,
+} from '../types';
 import { IAlertManager, IDatabaseManager } from './interfaces';
 import { CPDelta25Calculator, MovingAverageMonitor } from './calculation-engine';
-import { CvdAlertPayload } from '@crypto-data/cvd-core';
 import { AlertHistory } from '../types';
 import { logger } from '../utils/logger';
 
@@ -316,50 +322,146 @@ export class AlertManager extends EventEmitter implements IAlertManager {
   /**
    * Build Discord message content for CVD alerts
    */
-  private buildCVDMessage(payload: CvdAlertPayload): string {
-    const direction =
-      Math.abs(payload.triggerZScore) >= 1e-8
-        ? payload.triggerZScore >= 0
-          ? '買い優勢'
-          : '売り優勢'
-        : payload.cumulativeValue >= 0
-        ? '買い優勢'
-        : '売り優勢';
+  private buildCVDMessage(payload: CvdDeltaAlertPayload): string {
+    const directionLabel = payload.direction === 'buy' ? '買い優勢' : '売り優勢';
     const formattedDelta = Math.abs(payload.delta).toFixed(2);
-    const formattedCumulative = payload.cumulativeValue.toFixed(2);
     const formattedZScore = payload.zScore.toFixed(2);
-    const formattedDeltaZScore = payload.deltaZScore.toFixed(2);
-    const formattedTriggerZ = payload.triggerZScore.toFixed(2);
     const formattedTime = JST_FORMATTER.format(new Date(payload.timestamp));
-    const triggerLabel = payload.triggerSource === 'cumulative' ? '累積' : '差分';
+    const windowLabel = `${payload.windowHours}h`;
+    const bucketLabel = `${payload.bucketSpanMinutes}分`;
 
     return [
       `${CVD_ALERT_EMOJI}【Deribit CVD Alert】${payload.symbol}`,
       `時間: ${formattedTime}`,
-      `方向: ${direction}`,
-      `直近期差分: ${formattedDelta}`,
-      `累積出来高差: ${formattedCumulative}`,
-      `Zスコア(累積): ${formattedZScore}`,
-      `Zスコア(差分): ${formattedDeltaZScore}`,
-      `トリガー: ${triggerLabel} (${formattedTriggerZ}) / 閾値: ${payload.threshold}`,
+      `方向: ${directionLabel}`,
+      `バケット: ${bucketLabel}`,
+      `比較窓: ${windowLabel}`,
+      `差分出来高: ${formattedDelta}`,
+      `Zスコア: ${formattedZScore} / 閾値: ${payload.threshold.toFixed(2)}`,
     ].join('\n');
   }
 
-  async sendCvdAlertPayload(payload: CvdAlertPayload): Promise<void> {
-    if (await this.hasRecentAlert('CVD_ZSCORE', this.cvdCooldownMinutes)) {
+  async sendCvdAlertPayload(payload: CvdDeltaAlertPayload): Promise<void> {
+    const alertType = this.getCvdAlertType(payload.bucketSpanMinutes, payload.direction);
+    if (await this.hasRecentAlert(alertType, this.cvdCooldownMinutes)) {
       logger.debug('Skipping CVD alert due to cooldown window');
       return;
     }
 
     const message: AlertMessage = {
-      type: 'CVD_ZSCORE',
+      type: 'CVD_DELTA',
       timestamp: payload.timestamp,
-      value: payload.triggerZScore,
+      value: payload.zScore,
       threshold: payload.threshold,
       message: this.buildCVDMessage(payload),
     };
 
     await this.sendDiscordAlert(message);
+    await this.databaseManager.saveAlertHistory({
+      alertType,
+      timestamp: payload.timestamp,
+      value: payload.zScore,
+      threshold: payload.threshold,
+      message: message.message,
+    });
+    this.emit('cvdAlert', message);
+  }
+
+  private buildMarketTradeStartMessage(payload: MarketTradeStartPayload): string {
+    const formattedTime = JST_FORMATTER.format(new Date(payload.timestamp));
+    const directionLabel = payload.direction === 'buy' ? '成行買い' : '成行売り';
+    const formattedAmount = payload.amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+    return [
+      `${CVD_ALERT_EMOJI}【Deribit Trade Start】${payload.symbol}`,
+      `時間: ${formattedTime}`,
+      `方向: ${directionLabel}`,
+      `数量: ${formattedAmount}`,
+      `比較窓: ${payload.windowHours}h`,
+      `上位分位値(${(payload.quantileLevel * 100).toFixed(1)}%): ${payload.quantile.toLocaleString('en-US', {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 0,
+      })}`,
+      payload.secondaryQuantile
+        ? `補助分位値: ${payload.secondaryQuantile.toLocaleString('en-US', {
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 0,
+          })}`
+        : undefined,
+      payload.scale ? `スケール: ${payload.scale.toFixed(2)}` : undefined,
+      `Trade ID: ${payload.tradeId}`,
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join('\n');
+  }
+
+  async sendMarketTradeStartAlert(payload: MarketTradeStartPayload): Promise<void> {
+    const alertType = this.getMarketTradeStartAlertType(payload.direction);
+    if (await this.hasRecentAlert(alertType, this.cvdCooldownMinutes)) {
+      logger.debug('Skipping market trade spike alert due to cooldown window');
+      return;
+    }
+
+    const message: AlertMessage = {
+      type: 'MARKET_TRADE_START',
+      timestamp: payload.timestamp,
+      value: payload.amount,
+      threshold: payload.threshold,
+      message: this.buildMarketTradeStartMessage(payload),
+    };
+
+    await this.sendDiscordAlert(message);
+    await this.databaseManager.saveAlertHistory({
+      alertType,
+      timestamp: payload.timestamp,
+      value: payload.amount,
+      threshold: payload.threshold,
+      message: message.message,
+    });
+
+    this.emit('cvdAlert', message);
+  }
+
+  private buildCvdSlopeMessage(payload: CvdSlopeAlertPayload): string {
+    const formattedTime = JST_FORMATTER.format(new Date(payload.timestamp));
+    const directionLabel = payload.direction === 'buy' ? '買い優勢' : '売り優勢';
+    const deltaLabel = payload.delta.toFixed(2);
+    const slopeLabel = payload.slope.toFixed(4);
+    return [
+      `${CVD_ALERT_EMOJI}【Deribit CVD Slope】${payload.symbol}`,
+      `時間: ${formattedTime}`,
+      `方向: ${directionLabel}`,
+      `バケット: ${payload.bucketSpanMinutes}分`,
+      `差分出来高: ${deltaLabel}`,
+      `EMA傾き: ${slopeLabel}`,
+      `傾きZ: ${payload.slopeZ.toFixed(2)} / 閾値: ${payload.threshold.toFixed(2)}`,
+      `比較窓: ${payload.windowHours}h`,
+    ].join('\n');
+  }
+
+  async sendCvdSlopeAlert(payload: CvdSlopeAlertPayload): Promise<void> {
+    const alertType = this.getCvdSlopeAlertType(payload.bucketSpanMinutes, payload.direction);
+    if (await this.hasRecentAlert(alertType, this.cvdCooldownMinutes)) {
+      logger.debug('Skipping CVD slope alert due to cooldown window');
+      return;
+    }
+
+    const message: AlertMessage = {
+      type: 'CVD_SLOPE',
+      timestamp: payload.timestamp,
+      value: payload.slopeZ,
+      threshold: payload.threshold,
+      message: this.buildCvdSlopeMessage(payload),
+    };
+
+    await this.sendDiscordAlert(message);
+    await this.databaseManager.saveAlertHistory({
+      alertType,
+      timestamp: payload.timestamp,
+      value: payload.slopeZ,
+      threshold: payload.threshold,
+      message: message.message,
+    });
+
     this.emit('cvdAlert', message);
   }
 
@@ -367,7 +469,7 @@ export class AlertManager extends EventEmitter implements IAlertManager {
    * Format final Discord payload content
    */
   private formatDiscordContent(message: AlertMessage): string {
-    if (message.type === 'CVD_ZSCORE') {
+    if (message.type === 'CVD_DELTA' || message.type === 'MARKET_TRADE_START' || message.type === 'CVD_SLOPE') {
       return message.message;
     }
 
@@ -378,6 +480,20 @@ export class AlertManager extends EventEmitter implements IAlertManager {
       `値: ${message.value.toFixed(4)} / 閾値: ${message.threshold.toFixed(4)}`,
       `時間: ${formattedTime}`,
     ].join('\n');
+  }
+
+  private getCvdAlertType(bucketSpanMinutes: number, direction: 'buy' | 'sell'): string {
+    const directionLabel = direction === 'buy' ? 'BUY' : 'SELL';
+    return `CVD_DELTA_${bucketSpanMinutes}M_${directionLabel}`;
+  }
+
+  private getMarketTradeStartAlertType(direction: 'buy' | 'sell'): string {
+    return direction === 'buy' ? 'MARKET_TRADE_START_BUY' : 'MARKET_TRADE_START_SELL';
+  }
+
+  private getCvdSlopeAlertType(spanMinutes: number, direction: 'buy' | 'sell'): string {
+    const directionLabel = direction === 'buy' ? 'BUY' : 'SELL';
+    return `CVD_SLOPE_${spanMinutes}M_${directionLabel}`;
   }
 
   /**

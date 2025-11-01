@@ -18,9 +18,12 @@ import {
   OptionType,
   TradeDataRow,
   AlertQueueRecord,
+  CvdDeltaAlertPayload,
+  MarketTradeStartPayload,
+  CvdSlopeAlertPayload,
+  QueuedAlertPayload,
 } from '../types';
 import { IDatabaseManager, ProcessingState } from './interfaces';
-import { CvdAlertPayload } from '@crypto-data/cvd-core';
 
 export class DatabaseManager implements IDatabaseManager {
   private db: sqlite3.Database | null = null;
@@ -109,11 +112,13 @@ export class DatabaseManager implements IDatabaseManager {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT NOT NULL,
         timestamp INTEGER NOT NULL,
+        bucket_span_minutes INTEGER NOT NULL DEFAULT 5,
         cvd_value REAL NOT NULL,
         z_score REAL NOT NULL,
         delta_value REAL NOT NULL DEFAULT 0,
         delta_z_score REAL NOT NULL DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(symbol, bucket_span_minutes, timestamp)
       )`,
       `CREATE TABLE IF NOT EXISTS alert_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -235,6 +240,18 @@ export class DatabaseManager implements IDatabaseManager {
         });
       });
     }
+
+    if (!columnNames.has('bucket_span_minutes')) {
+      await new Promise<void>((resolve, reject) => {
+        db.run('ALTER TABLE cvd_data ADD COLUMN bucket_span_minutes INTEGER NOT NULL DEFAULT 5', (err) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
+      });
+    }
   }
 
   /**
@@ -244,12 +261,13 @@ export class DatabaseManager implements IDatabaseManager {
     const db = this.getDatabase();
 
     const indexes = [
+      'DROP INDEX IF EXISTS idx_cvd_data_symbol_bucket_timestamp',
       'CREATE INDEX IF NOT EXISTS idx_trade_data_timestamp ON trade_data(timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_trade_data_symbol ON trade_data(symbol)',
       'CREATE INDEX IF NOT EXISTS idx_trade_data_block ON trade_data(is_block_trade, timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_option_data_timestamp ON option_data(timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_option_data_symbol ON option_data(symbol)',
-      'CREATE INDEX IF NOT EXISTS idx_cvd_data_timestamp ON cvd_data(timestamp)',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_cvd_data_symbol_bucket_timestamp ON cvd_data(symbol, bucket_span_minutes, timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_alert_history_timestamp ON alert_history(timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_alert_history_type ON alert_history(alert_type)',
       'CREATE INDEX IF NOT EXISTS idx_order_flow_ratio_timestamp ON order_flow_ratio(timestamp)',
@@ -648,18 +666,26 @@ export class DatabaseManager implements IDatabaseManager {
     const db = this.getDatabase();
 
     const insertSql = `
-      INSERT INTO cvd_data (symbol, timestamp, cvd_value, z_score, delta_value, delta_z_score)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO cvd_data (symbol, timestamp, bucket_span_minutes, cvd_value, z_score, delta_value, delta_z_score)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(symbol, bucket_span_minutes, timestamp)
+      DO UPDATE SET
+        cvd_value = excluded.cvd_value,
+        z_score = excluded.z_score,
+        delta_value = excluded.delta_value,
+        delta_z_score = excluded.delta_z_score,
+        created_at = CURRENT_TIMESTAMP
     `;
 
     return new Promise((resolve, reject) => {
         db.run(insertSql, [
           data.symbol,
           data.timestamp,
-          data.cvdValue,
-          data.zScore,
-          data.delta ?? 0,
-          data.deltaZScore ?? 0
+          data.bucketSpanMinutes,
+          data.cvdValue ?? data.delta,
+          data.zScore ?? data.deltaZScore,
+          data.delta,
+          data.deltaZScore,
       ], (err) => {
         if (err) {
           console.error('Failed to save CVD data:', err);
@@ -674,58 +700,38 @@ export class DatabaseManager implements IDatabaseManager {
   /**
    * Get CVD data for Z-score calculation (last 24 hours)
    */
+  /**
+   * Backwards-compatible helper to retrieve recent 5分バケットのCVDデータ
+   */
   async getCVDDataLast24Hours(symbol: string): Promise<CVDData[]> {
-    const db = this.getDatabase();
-    const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
-    
-    const selectSql = `
-      SELECT 
-        symbol as symbol,
-        timestamp, 
-        cvd_value as cvdValue, 
-        z_score as zScore,
-        delta_value as delta,
-        delta_z_score as deltaZScore
-      FROM cvd_data 
-      WHERE symbol = ?
-        AND timestamp >= ?
-      ORDER BY timestamp ASC
-    `;
-
-    return new Promise((resolve, reject) => {
-      db.all(selectSql, [symbol, twentyFourHoursAgo], (err, rows) => {
-        if (err) {
-          console.error('Failed to get CVD data:', err);
-          reject(err);
-        } else {
-          resolve(rows as CVDData[]);
-        }
-      });
-    });
+    const since = Date.now() - 24 * 60 * 60 * 1000;
+    return this.getCvdDataSince(symbol, 5, since);
   }
 
   /**
-   * Get CVD data from a specific timestamp
+   * Get CVD delta data since a specific timestamp for the given bucket span
    */
-  async getCVDDataSince(symbol: string, since: number): Promise<CVDData[]> {
+  async getCvdDataSince(symbol: string, bucketSpanMinutes: number, since: number): Promise<CVDData[]> {
     const db = this.getDatabase();
 
     const selectSql = `
       SELECT 
         symbol as symbol,
         timestamp,
+        bucket_span_minutes as bucketSpanMinutes,
         cvd_value as cvdValue,
         z_score as zScore,
         delta_value as delta,
         delta_z_score as deltaZScore
       FROM cvd_data
       WHERE symbol = ?
+        AND bucket_span_minutes = ?
         AND timestamp >= ?
       ORDER BY timestamp ASC
     `;
 
     return new Promise((resolve, reject) => {
-      db.all(selectSql, [symbol, since], (err, rows) => {
+      db.all(selectSql, [symbol, bucketSpanMinutes, since], (err, rows) => {
         if (err) {
           console.error('Failed to get CVD data since timestamp:', err);
           reject(err);
@@ -861,7 +867,7 @@ export class DatabaseManager implements IDatabaseManager {
   /**
    * Enqueue alert payload for asynchronous dispatch
    */
-  async enqueueAlert(alertType: string, payload: CvdAlertPayload, timestamp: number): Promise<number> {
+  async enqueueAlert(alertType: string, payload: QueuedAlertPayload, timestamp: number): Promise<number> {
     const db = this.getDatabase();
 
     const insertSql = `
@@ -914,7 +920,7 @@ export class DatabaseManager implements IDatabaseManager {
               id: Number(row['id']),
               alertType: String(row['alertType'] ?? ''),
               timestamp: Number(row['timestamp'] ?? 0),
-              payload: JSON.parse(String(row['payloadJson'] ?? '{}')) as CvdAlertPayload,
+              payload: this.parseAlertPayload(String(row['payloadJson'] ?? '{}'), String(row['alertType'] ?? '')),
               attemptCount: Number(row['attemptCount'] ?? 0),
             };
 
@@ -936,6 +942,25 @@ export class DatabaseManager implements IDatabaseManager {
         }
       });
     });
+  }
+
+  private parseAlertPayload(payloadJson: string, alertType: string): QueuedAlertPayload {
+    try {
+      const parsed = JSON.parse(payloadJson);
+      if (alertType.startsWith('CVD_DELTA_')) {
+        return parsed as CvdDeltaAlertPayload;
+      }
+      if (alertType.startsWith('MARKET_TRADE_START')) {
+        return parsed as MarketTradeStartPayload;
+      }
+      if (alertType.startsWith('CVD_SLOPE_')) {
+        return parsed as CvdSlopeAlertPayload;
+      }
+      return parsed as QueuedAlertPayload;
+    } catch (error) {
+      console.error('Failed to parse alert payload JSON', { alertType, error });
+      return {} as QueuedAlertPayload;
+    }
   }
 
   /**

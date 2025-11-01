@@ -1,8 +1,7 @@
 import { DatabaseManager } from '../database';
 import { AlertManager } from '../alert-manager';
 import { AlertQueueProcessor } from '../alert-queue-processor';
-import { OptionData } from '../../types';
-import { CvdAlertPayload } from '@crypto-data/cvd-core';
+import { OptionData, CvdDeltaAlertPayload } from '../../types';
 
 describe('System Integration', () => {
   jest.setTimeout(10000);
@@ -63,19 +62,18 @@ describe('System Integration', () => {
       const databaseManager = new DatabaseManager(':memory:');
       await databaseManager.initializeDatabase();
 
-      const payload: CvdAlertPayload = {
+      const payload: CvdDeltaAlertPayload = {
         symbol: 'BTC-PERP',
         timestamp: Date.now(),
-        triggerSource: 'cumulative',
-        triggerZScore: 3.1,
-        zScore: 3.1,
+        bucketSpanMinutes: 5,
         delta: 1.2,
-        deltaZScore: 2.1,
+        zScore: 3.1,
         threshold: 2.5,
-        cumulativeValue: 25,
+        direction: 'buy',
+        windowHours: 72,
       };
 
-      await databaseManager.enqueueAlert('CVD_ZSCORE', payload, payload.timestamp);
+      await databaseManager.enqueueAlert('CVD_DELTA_5M_BUY', payload, payload.timestamp);
 
       const httpClient = { post: jest.fn().mockResolvedValue({ status: 204 }) };
       const alertManager = new AlertManager(databaseManager, {
@@ -99,7 +97,7 @@ describe('System Integration', () => {
       await processor.stop();
 
       expect(httpClient.post).toHaveBeenCalledTimes(1);
-      const cvdAlerts = await databaseManager.getRecentAlerts('CVD_ZSCORE', 60);
+      const cvdAlerts = await databaseManager.getRecentAlerts('CVD_DELTA_5M_BUY', 60);
       expect(cvdAlerts).toHaveLength(1);
 
       await databaseManager.closeDatabase();

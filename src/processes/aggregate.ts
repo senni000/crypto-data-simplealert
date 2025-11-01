@@ -25,6 +25,15 @@ async function bootstrap(): Promise<void> {
       batchSize: config.cvdAggregationBatchSize,
       pollIntervalMs: config.cvdAggregationPollIntervalMs,
       suppressionWindowMinutes: config.cvdAlertSuppressionMinutes,
+      historyWindowHours: config.marketTradeWindowHours,
+      marketTradeWindowHours: config.marketTradeWindowHours,
+      marketTradePrimaryQuantile: config.marketTradePrimaryQuantile,
+      marketTradeSecondaryQuantile: config.marketTradeSecondaryQuantile,
+      marketTradeMinSamples: config.marketTradeMinSamples,
+      marketTradeLinkMinutes: config.marketTradeLinkMinutes,
+      cvdSlopeThreshold: config.cvdSlopeThreshold,
+      cvdSlopeEmaAlpha: config.cvdSlopeEmaAlpha,
+      cvdSlopeWindowHours: config.cvdSlopeWindowHours,
     }
   );
 

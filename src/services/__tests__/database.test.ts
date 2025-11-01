@@ -287,6 +287,7 @@ describe('DatabaseManager', () => {
       zScore: 2.5,
       delta: 0,
       deltaZScore: 0,
+      bucketSpanMinutes: 5,
     };
 
     it('should save CVD data successfully', async () => {
@@ -304,6 +305,7 @@ describe('DatabaseManager', () => {
         zScore: 1.0,
         delta: 0,
         deltaZScore: 0,
+        bucketSpanMinutes: 5,
       };
       
       // Save recent CVD data (1 hour ago)
@@ -314,6 +316,7 @@ describe('DatabaseManager', () => {
         zScore: 2.0,
         delta: 0,
         deltaZScore: 0,
+        bucketSpanMinutes: 5,
       };
       
       await dbManager.saveCVDData(oldCVDData);
@@ -342,7 +345,7 @@ describe('DatabaseManager', () => {
 
   describe('Alert History Operations', () => {
     const sampleAlertHistory: AlertHistory = {
-      alertType: 'CVD_ZSCORE',
+      alertType: 'CVD_DELTA_5M_BUY',
       timestamp: Date.now(),
       value: 2.5,
       threshold: 2.0,
@@ -372,7 +375,7 @@ describe('DatabaseManager', () => {
       await dbManager.saveAlertHistory(recentAlert);
       
       // Get alerts from last 30 minutes
-      const recentAlerts = await dbManager.getRecentAlerts('CVD_ZSCORE', 30);
+      const recentAlerts = await dbManager.getRecentAlerts('CVD_DELTA_5M_BUY', 30);
       
       // Should only return the recent alert
       expect(recentAlerts).toHaveLength(1);
@@ -381,11 +384,11 @@ describe('DatabaseManager', () => {
 
     it('should maintain data integrity for alert history', async () => {
       await dbManager.saveAlertHistory(sampleAlertHistory);
-      const retrieved = await dbManager.getRecentAlerts('CVD_ZSCORE', 60);
+      const retrieved = await dbManager.getRecentAlerts('CVD_DELTA_5M_BUY', 60);
       
       expect(retrieved).toHaveLength(1);
       expect(retrieved[0]!).toMatchObject({
-        alertType: 'CVD_ZSCORE',
+        alertType: 'CVD_DELTA_5M_BUY',
         value: 2.5,
         threshold: 2.0,
         message: 'CVD Z-score exceeded threshold'
@@ -395,7 +398,7 @@ describe('DatabaseManager', () => {
 
     it('should filter alerts by type correctly', async () => {
       const cvdAlert: AlertHistory = {
-        alertType: 'CVD_ZSCORE',
+        alertType: 'CVD_DELTA_5M_BUY',
         timestamp: Date.now(),
         value: 2.5,
         threshold: 2.0,
@@ -413,12 +416,12 @@ describe('DatabaseManager', () => {
       await dbManager.saveAlertHistory(cvdAlert);
       await dbManager.saveAlertHistory(cpAlert);
       
-      const cvdAlerts = await dbManager.getRecentAlerts('CVD_ZSCORE', 60);
+      const cvdAlerts = await dbManager.getRecentAlerts('CVD_DELTA_5M_BUY', 60);
       const cpAlerts = await dbManager.getRecentAlerts('CP_DELTA_25', 60);
       
       expect(cvdAlerts).toHaveLength(1);
       expect(cpAlerts).toHaveLength(1);
-      expect(cvdAlerts[0]!.alertType).toBe('CVD_ZSCORE');
+      expect(cvdAlerts[0]!.alertType).toBe('CVD_DELTA_5M_BUY');
       expect(cpAlerts[0]!.alertType).toBe('CP_DELTA_25');
     });
   });
