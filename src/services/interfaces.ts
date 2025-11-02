@@ -53,10 +53,12 @@ export interface AppConfig {
   analyticsInstrumentRefreshIntervalMs: number;
   analyticsRatioWindowUsd: number;
   enableCvdAlerts: boolean;
-  marketTradeWindowHours: number;
-  marketTradePrimaryQuantile: number;
-  marketTradeSecondaryQuantile: number;
-  marketTradeMinSamples: number;
+  marketTradeShortWindowMinutes: number;
+  marketTradeShortQuantile: number;
+  marketTradeShortMinSamples: number;
+  marketTradeZScoreWindowMinutes: number;
+  marketTradeZScoreThreshold: number;
+  marketTradeZScoreMinSamples: number;
   marketTradeLinkMinutes: number;
   cvdSlopeThreshold: number;
   cvdSlopeEmaAlpha: number;

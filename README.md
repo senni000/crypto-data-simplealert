@@ -33,7 +33,7 @@
 
 #### 派生指標の蓄積
 - `CvdAggregationWorker` が `trade_data` を巡回し、5 分・30 分バケットそれぞれについて直近 72 時間の差分出来高（デルタ）を集計し、Z スコアを求めて `cvd_data` テーブルへ保存します。閾値超過時は `alert_queue` に `CVD_DELTA_{SPAN}M_{BUY/SELL}` ペイロードを enqueue します。
-- 同時に個々の成行約定サイズを 72 時間分追跡し、分布の上位分位（既定 99%）を超えた起点トレードを `MARKET_TRADE_START_{BUY/SELL}` として enqueue します。
+- 成行約定サイズについては、30分窓の上位分位（既定 99%）判定と、対数スケールのZスコア判定という2系統のロジックで異常なトレード開始を検出し、`MARKET_TRADE_START_SHORT_WINDOW_{BUY/SELL}` および `MARKET_TRADE_START_LOG_Z_{BUY/SELL}` のアラートを enqueue します。
 - `AlertManager.checkCPDelta25Alert` が `CPDelta25Calculator` でデルタが +0.25/-0.25 に最も近いコール・プットを選び、`MovingAverageMonitor`（期間 10）に値を渡して移動平均系列を維持します。
 
 ### アラートの種類
@@ -46,7 +46,7 @@
   - 配送完了後に `alert_history` にアラート種別・値・閾値・メッセージを記録します。
 
 - **MARKET_TRADE_START（テキスト）**  
-  - 72 時間分の市場成行約定サイズから求めた上位分位（既定 99%）を超える起点トレードを検出し、Trade ID や分位値を含むメッセージを送信します。  
+  - 30 分窓の出来高分布に対する 99% 分位突破と、対数変換した約定サイズの Z スコア閾値超過という 2 つの異常検知ロジックを評価し、Trade ID やスコア情報を含むメッセージを送信します。  
   - 配送完了後に `alert_history` にアラート種別・値・閾値・メッセージを記録します。
 
 - **CVD_SLOPE（テキスト）**  

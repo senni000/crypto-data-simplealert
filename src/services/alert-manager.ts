@@ -367,45 +367,89 @@ export class AlertManager extends EventEmitter implements IAlertManager {
     this.emit('cvdAlert', message);
   }
 
+  private formatMarketTradeAmount(value: number): string {
+    if (!Number.isFinite(value)) {
+      return '-';
+    }
+
+    const absValue = Math.abs(value);
+    let maximumFractionDigits = 2;
+
+    if (absValue < 1) {
+      if (absValue < 0.0001) {
+        maximumFractionDigits = 8;
+      } else if (absValue < 0.001) {
+        maximumFractionDigits = 7;
+      } else if (absValue < 0.01) {
+        maximumFractionDigits = 6;
+      } else if (absValue < 0.1) {
+        maximumFractionDigits = 5;
+      } else {
+        maximumFractionDigits = 4;
+      }
+    } else if (absValue < 10) {
+      maximumFractionDigits = 4;
+    } else if (absValue < 100) {
+      maximumFractionDigits = 3;
+    }
+
+    return value.toLocaleString('en-US', {
+      minimumFractionDigits: 0,
+      maximumFractionDigits,
+    });
+  }
+
   private buildMarketTradeStartMessage(payload: MarketTradeStartPayload): string {
     const formattedTime = JST_FORMATTER.format(new Date(payload.timestamp));
     const directionLabel = payload.direction === 'buy' ? '成行買い' : '成行売り';
-    const formattedAmount = payload.amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
-    return [
+    const formattedAmount = `${this.formatMarketTradeAmount(payload.amount)} BTC`;
+    const windowLabel = `${Math.round(payload.windowMinutes)}分`;
+
+    const lines: Array<string | undefined> = [
       `${CVD_ALERT_EMOJI}【Deribit Trade Start】${payload.symbol}`,
       `時間: ${formattedTime}`,
       `方向: ${directionLabel}`,
       `数量: ${formattedAmount}`,
-      `比較窓: ${payload.windowHours}h`,
-      `上位分位値(${(payload.quantileLevel * 100).toFixed(1)}%): ${payload.quantile.toLocaleString('en-US', {
-        minimumFractionDigits: 0,
-        maximumFractionDigits: 0,
-      })}`,
-      payload.secondaryQuantile
-        ? `補助分位値: ${payload.secondaryQuantile.toLocaleString('en-US', {
-            minimumFractionDigits: 0,
-            maximumFractionDigits: 0,
-          })}`
-        : undefined,
-      payload.scale ? `スケール: ${payload.scale.toFixed(2)}` : undefined,
-      `Trade ID: ${payload.tradeId}`,
-    ]
-      .filter((line): line is string => Boolean(line))
-      .join('\n');
+      `戦略: ${payload.strategy === 'SHORT_WINDOW_QUANTILE' ? '短期分位判定' : '対数Zスコア判定'}`,
+      `窓: ${windowLabel}`,
+    ];
+
+    if (payload.strategy === 'SHORT_WINDOW_QUANTILE') {
+      lines.push(
+        `分位(${(payload.quantileLevel * 100).toFixed(2)}%): ${this.formatMarketTradeAmount(payload.quantile)} BTC`,
+        `サンプル数: ${payload.sampleCount}`
+      );
+    } else {
+      lines.push(
+        `Zスコア: ${payload.zScore.toFixed(2)} / 閾値: ${payload.zScoreThreshold.toFixed(2)}`,
+        `log平均: ${payload.logMean.toFixed(4)} / logσ: ${payload.logStdDev.toFixed(4)}`,
+        `log数量: ${payload.logAmount.toFixed(4)}`,
+        `サンプル数: ${payload.sampleCount}`
+      );
+    }
+
+    lines.push(`Trade ID: ${payload.tradeId}`);
+
+    return lines.filter((line): line is string => Boolean(line)).join('\n');
   }
 
   async sendMarketTradeStartAlert(payload: MarketTradeStartPayload): Promise<void> {
-    const alertType = this.getMarketTradeStartAlertType(payload.direction);
+    const alertType = this.getMarketTradeStartAlertType(payload);
     if (await this.hasRecentAlert(alertType, this.cvdCooldownMinutes)) {
       logger.debug('Skipping market trade spike alert due to cooldown window');
       return;
     }
 
+    const metricValue =
+      payload.strategy === 'SHORT_WINDOW_QUANTILE' ? payload.amount : payload.zScore;
+    const metricThreshold =
+      payload.strategy === 'SHORT_WINDOW_QUANTILE' ? payload.threshold : payload.zScoreThreshold;
+
     const message: AlertMessage = {
       type: 'MARKET_TRADE_START',
       timestamp: payload.timestamp,
-      value: payload.amount,
-      threshold: payload.threshold,
+      value: metricValue,
+      threshold: metricThreshold,
       message: this.buildMarketTradeStartMessage(payload),
     };
 
@@ -413,8 +457,8 @@ export class AlertManager extends EventEmitter implements IAlertManager {
     await this.databaseManager.saveAlertHistory({
       alertType,
       timestamp: payload.timestamp,
-      value: payload.amount,
-      threshold: payload.threshold,
+      value: metricValue,
+      threshold: metricThreshold,
       message: message.message,
     });
 
@@ -487,8 +531,12 @@ export class AlertManager extends EventEmitter implements IAlertManager {
     return `CVD_DELTA_${bucketSpanMinutes}M_${directionLabel}`;
   }
 
-  private getMarketTradeStartAlertType(direction: 'buy' | 'sell'): string {
-    return direction === 'buy' ? 'MARKET_TRADE_START_BUY' : 'MARKET_TRADE_START_SELL';
+  private getMarketTradeStartAlertType(payload: MarketTradeStartPayload): string {
+    const prefix =
+      payload.strategy === 'SHORT_WINDOW_QUANTILE'
+        ? 'MARKET_TRADE_START_SHORT_WINDOW'
+        : 'MARKET_TRADE_START_LOG_Z';
+    return payload.direction === 'buy' ? `${prefix}_BUY` : `${prefix}_SELL`;
   }
 
   private getCvdSlopeAlertType(spanMinutes: number, direction: 'buy' | 'sell'): string {

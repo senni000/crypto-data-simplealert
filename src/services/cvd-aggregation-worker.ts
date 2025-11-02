@@ -5,6 +5,7 @@ import {
   TradeDataRow,
   CvdDeltaAlertPayload,
   MarketTradeStartPayload,
+  MarketTradeStartStrategy,
   CvdSlopeAlertPayload,
 } from '../types';
 import { logger } from '../utils/logger';
@@ -15,10 +16,12 @@ export interface CvdAggregationWorkerOptions {
   suppressionWindowMinutes?: number;
   bucketSpansMinutes?: number[];
   historyWindowHours?: number;
-  marketTradeWindowHours?: number;
-  marketTradePrimaryQuantile?: number;
-  marketTradeSecondaryQuantile?: number;
-  marketTradeMinSamples?: number;
+  marketTradeShortWindowMinutes?: number;
+  marketTradeShortQuantile?: number;
+  marketTradeShortMinSamples?: number;
+  marketTradeZScoreWindowMinutes?: number;
+  marketTradeZScoreThreshold?: number;
+  marketTradeZScoreMinSamples?: number;
   marketTradeLinkMinutes?: number;
   cvdSlopeThreshold?: number;
   cvdSlopeEmaAlpha?: number;
@@ -50,10 +53,13 @@ interface SlopeUpdateResult {
 
 const PROCESS_NAME = 'deribit_cvd_aggregator';
 
-const DEFAULT_MARKET_TRADE_WINDOW_HOURS = 72;
-const DEFAULT_PRIMARY_QUANTILE = 0.99;
-const DEFAULT_SECONDARY_QUANTILE = 0.95;
-const DEFAULT_MIN_SAMPLES = 500;
+const DEFAULT_HISTORY_WINDOW_HOURS = 72;
+const DEFAULT_SHORT_WINDOW_MINUTES = 30;
+const DEFAULT_SHORT_QUANTILE = 0.99;
+const DEFAULT_SHORT_MIN_SAMPLES = 200;
+const DEFAULT_ZSCORE_WINDOW_MINUTES = 360;
+const DEFAULT_ZSCORE_THRESHOLD = 3;
+const DEFAULT_ZSCORE_MIN_SAMPLES = 200;
 const DEFAULT_LINK_MINUTES = 10;
 const DEFAULT_SLOPE_THRESHOLD = 1.5;
 const DEFAULT_SLOPE_ALPHA = 0.3;
@@ -87,91 +93,25 @@ function computeStd(values: number[], mean?: number): number {
   return Math.sqrt(variance);
 }
 
-class TradeAmountTracker {
-  private readonly minLog: number;
-  private readonly maxLog: number;
-  private readonly step: number;
-  private readonly counts: number[];
-  private readonly entries: Array<{ timestamp: number; amount: number; bucket: number }> = [];
+class ShortWindowQuantileTracker {
+  private readonly quantile: number;
+  private readonly entries: Array<{ timestamp: number; amount: number } | null> = [];
+  private readonly sorted: number[] = [];
   private head = 0;
-  private total = 0;
 
-  constructor(
-    private readonly windowMs: number,
-    private readonly bucketCount = 256,
-    minAmount = 1,
-    maxAmount = 100_000_000
-  ) {
-    this.minLog = Math.log10(Math.max(1e-6, minAmount));
-    this.maxLog = Math.log10(Math.max(minAmount * 10, maxAmount));
-    this.step = (this.maxLog - this.minLog) / this.bucketCount;
-    this.counts = new Array(bucketCount).fill(0);
+  constructor(private readonly windowMs: number, quantile: number) {
+    this.quantile = clamp(quantile, 0, 1);
   }
 
-  add(timestamp: number, amount: number): void {
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return;
-    }
-    this.prune(timestamp);
-    const bucket = this.getBucketIndex(amount);
-    this.entries.push({ timestamp, amount, bucket });
-    this.counts[bucket] = (this.counts[bucket] ?? 0) + 1;
-    this.total += 1;
-  }
-
-  hasSamples(minSamples: number): boolean {
-    return this.total >= minSamples;
-  }
-
-  getQuantile(probability: number): number | null {
-    if (this.total === 0) {
-      return null;
-    }
-    const target = clamp(probability, 0, 1) * (this.total - 1);
-    let cumulative = 0;
-    for (let index = 0; index < this.counts.length; index += 1) {
-      const count = this.counts[index] ?? 0;
-      if (count <= 0) {
-        continue;
-      }
-      if (cumulative + count > target) {
-        const fraction = (target - cumulative) / count;
-        return this.bucketToValue(index, fraction);
-      }
-      cumulative += count;
-    }
-    return this.bucketToValue(this.counts.length - 1, 1);
-  }
-
-  getIqrScale(): number | null {
-    const q1 = this.getQuantile(0.25);
-    const q3 = this.getQuantile(0.75);
-    if (q1 === null || q3 === null) {
-      return null;
-    }
-    const iqr = q3 - q1;
-    if (iqr <= 0) {
-      return null;
-    }
-    return iqr / 1.349; // Approximate conversion to standard deviation
-  }
-
-  getWindowHours(): number {
-    return this.windowMs / (60 * 60 * 1000);
-  }
-
-  private prune(currentTimestamp: number): void {
+  prune(currentTimestamp: number): void {
     const cutoff = currentTimestamp - this.windowMs;
     while (this.head < this.entries.length) {
       const entry = this.entries[this.head];
       if (!entry || entry.timestamp >= cutoff) {
         break;
       }
-      if (entry.bucket >= 0 && entry.bucket < this.counts.length) {
-        const current = this.counts[entry.bucket] ?? 0;
-        this.counts[entry.bucket] = current > 0 ? current - 1 : 0;
-      }
-      this.total -= 1;
+      this.removeAmount(entry.amount);
+      this.entries[this.head] = null;
       this.head += 1;
     }
     if (this.head > 4096 && this.head > this.entries.length / 2) {
@@ -180,18 +120,152 @@ class TradeAmountTracker {
     }
   }
 
-  private getBucketIndex(amount: number): number {
-    const logAmount = Math.log10(amount);
-    const position = (logAmount - this.minLog) / this.step;
-    const index = Math.floor(clamp(position, 0, this.bucketCount - 1));
-    return index;
+  addSample(timestamp: number, amount: number): void {
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return;
+    }
+    this.entries.push({ timestamp, amount });
+    const index = this.lowerBound(amount);
+    this.sorted.splice(index, 0, amount);
   }
 
-  private bucketToValue(index: number, fraction: number): number {
-    const lowerLog = this.minLog + index * this.step;
-    const upperLog = lowerLog + this.step;
-    const valueLog = lowerLog + clamp(fraction, 0, 1) * (upperLog - lowerLog);
-    return 10 ** valueLog;
+  getSampleCount(): number {
+    return this.sorted.length;
+  }
+
+  getQuantile(): number | null {
+    if (this.sorted.length === 0) {
+      return null;
+    }
+    if (this.sorted.length === 1) {
+      return this.sorted[0]!;
+    }
+    const targetIndex = Math.min(
+      this.sorted.length - 1,
+      Math.max(0, Math.floor(this.quantile * (this.sorted.length - 1)))
+    );
+    return this.sorted[targetIndex]!;
+  }
+
+  getWindowMinutes(): number {
+    return this.windowMs / (60 * 1000);
+  }
+
+  private lowerBound(value: number): number {
+    let low = 0;
+    let high = this.sorted.length;
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (this.sorted[mid]! < value) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    return low;
+  }
+
+  private removeAmount(value: number): void {
+    const index = this.findExistingIndex(value);
+    if (index !== -1) {
+      this.sorted.splice(index, 1);
+    }
+  }
+
+  private findExistingIndex(value: number): number {
+    let low = 0;
+    let high = this.sorted.length - 1;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const current = this.sorted[mid]!;
+      if (current === value) {
+        let left = mid;
+        while (left > 0 && this.sorted[left - 1] === value) {
+          left -= 1;
+        }
+        return left;
+      }
+      if (current < value) {
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return -1;
+  }
+}
+
+class LogZScoreTracker {
+  private readonly entries: Array<{ timestamp: number; logAmount: number } | null> = [];
+  private head = 0;
+  private sum = 0;
+  private sumSquares = 0;
+  private count = 0;
+
+  constructor(private readonly windowMs: number) {}
+
+  prune(currentTimestamp: number): void {
+    const cutoff = currentTimestamp - this.windowMs;
+    while (this.head < this.entries.length) {
+      const entry = this.entries[this.head];
+      if (!entry || entry.timestamp >= cutoff) {
+        break;
+      }
+      this.sum -= entry.logAmount;
+      this.sumSquares -= entry.logAmount * entry.logAmount;
+      this.count = Math.max(0, this.count - 1);
+      this.entries[this.head] = null;
+      this.head += 1;
+    }
+    if (this.head > 4096 && this.head > this.entries.length / 2) {
+      this.entries.splice(0, this.head);
+      this.head = 0;
+    }
+  }
+
+  addSample(timestamp: number, amount: number): void {
+    const logAmount = this.toLog(amount);
+    if (logAmount === null) {
+      return;
+    }
+    this.entries.push({ timestamp, logAmount });
+    this.sum += logAmount;
+    this.sumSquares += logAmount * logAmount;
+    this.count += 1;
+  }
+
+  getSampleCount(): number {
+    return this.count;
+  }
+
+  getWindowMinutes(): number {
+    return this.windowMs / (60 * 1000);
+  }
+
+  getZScore(amount: number):
+    | { zScore: number; mean: number; std: number; logAmount: number; sampleCount: number }
+    | null {
+    const logAmount = this.toLog(amount);
+    if (logAmount === null || this.count < 2) {
+      return null;
+    }
+    const mean = this.sum / this.count;
+    const varianceNumerator = this.sumSquares - (this.sum * this.sum) / this.count;
+    const variance =
+      this.count > 1 ? varianceNumerator / (this.count - 1) : Number.POSITIVE_INFINITY;
+    const std = Math.sqrt(Math.max(variance, 1e-12));
+    if (!Number.isFinite(std) || std <= 0) {
+      return null;
+    }
+    const zScore = (logAmount - mean) / std;
+    return { zScore, mean, std, logAmount, sampleCount: this.count };
+  }
+
+  private toLog(amount: number): number | null {
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return null;
+    }
+    return Math.log(amount);
   }
 }
 
@@ -265,17 +339,20 @@ export class CvdAggregationWorker extends EventEmitter {
   private readonly tradeSymbols: Set<string>;
   private readonly bucketConfigs: BucketConfig[];
 
-  private readonly marketTradeWindowMs: number;
-  private readonly marketTradePrimaryQuantile: number;
-  private readonly marketTradeSecondaryQuantile: number;
-  private readonly marketTradeMinSamples: number;
+  private readonly marketTradeShortWindowMs: number;
+  private readonly marketTradeShortQuantile: number;
+  private readonly marketTradeShortMinSamples: number;
+  private readonly marketTradeZScoreWindowMs: number;
+  private readonly marketTradeZScoreThreshold: number;
+  private readonly marketTradeZScoreMinSamples: number;
   private readonly marketTradeLinkWindowMs: number;
   private readonly cvdSlopeThreshold: number;
   private readonly cvdSlopeAlpha: number;
   private readonly cvdSlopeWindowMs: number;
 
   private readonly bucketStates = new Map<number, BucketState>();
-  private readonly tradeTrackers: Record<'buy' | 'sell', TradeAmountTracker>;
+  private readonly shortWindowTrackers: Record<'buy' | 'sell', ShortWindowQuantileTracker>;
+  private readonly logZScoreTrackers: Record<'buy' | 'sell', LogZScoreTracker>;
   private readonly slopeStates = new Map<number, SlopeTracker>();
   private readonly lastTradeStartTimestamp: Record<'buy' | 'sell', number | null> = {
     buy: null,
@@ -307,26 +384,33 @@ export class CvdAggregationWorker extends EventEmitter {
     this.pollIntervalMs = Math.max(500, Math.floor(options.pollIntervalMs ?? 2000));
     this.suppressionWindowMs = Math.max(0, Math.floor((options.suppressionWindowMinutes ?? 30) * 60 * 1000));
 
-    const historyWindowHours = Math.max(1, Math.floor(options.historyWindowHours ?? DEFAULT_MARKET_TRADE_WINDOW_HOURS));
+    const historyWindowHours = Math.max(1, Math.floor(options.historyWindowHours ?? DEFAULT_HISTORY_WINDOW_HOURS));
     const historyWindowMs = historyWindowHours * 60 * 60 * 1000;
     const spans = options.bucketSpansMinutes && options.bucketSpansMinutes.length > 0 ? options.bucketSpansMinutes : [5, 30];
     this.bucketConfigs = spans.map((spanMinutes) => ({ spanMinutes, windowMs: historyWindowMs }));
 
-    this.marketTradeWindowMs = Math.max(
+    this.marketTradeShortWindowMs = Math.max(
       1,
-      Math.floor((options.marketTradeWindowHours ?? DEFAULT_MARKET_TRADE_WINDOW_HOURS) * 60 * 60 * 1000)
+      Math.floor((options.marketTradeShortWindowMinutes ?? DEFAULT_SHORT_WINDOW_MINUTES) * 60 * 1000)
     );
-    this.marketTradePrimaryQuantile = clamp(
-      options.marketTradePrimaryQuantile ?? DEFAULT_PRIMARY_QUANTILE,
+    this.marketTradeShortQuantile = clamp(
+      options.marketTradeShortQuantile ?? DEFAULT_SHORT_QUANTILE,
       0.5,
       0.9999
     );
-    this.marketTradeSecondaryQuantile = clamp(
-      options.marketTradeSecondaryQuantile ?? DEFAULT_SECONDARY_QUANTILE,
-      0.5,
-      this.marketTradePrimaryQuantile
+    this.marketTradeShortMinSamples = Math.max(
+      10,
+      Math.floor(options.marketTradeShortMinSamples ?? DEFAULT_SHORT_MIN_SAMPLES)
     );
-    this.marketTradeMinSamples = Math.max(10, Math.floor(options.marketTradeMinSamples ?? DEFAULT_MIN_SAMPLES));
+    this.marketTradeZScoreWindowMs = Math.max(
+      1,
+      Math.floor((options.marketTradeZScoreWindowMinutes ?? DEFAULT_ZSCORE_WINDOW_MINUTES) * 60 * 1000)
+    );
+    this.marketTradeZScoreThreshold = options.marketTradeZScoreThreshold ?? DEFAULT_ZSCORE_THRESHOLD;
+    this.marketTradeZScoreMinSamples = Math.max(
+      10,
+      Math.floor(options.marketTradeZScoreMinSamples ?? DEFAULT_ZSCORE_MIN_SAMPLES)
+    );
     this.marketTradeLinkWindowMs = Math.max(
       0,
       Math.floor((options.marketTradeLinkMinutes ?? DEFAULT_LINK_MINUTES) * 60 * 1000)
@@ -338,9 +422,13 @@ export class CvdAggregationWorker extends EventEmitter {
       Math.floor((options.cvdSlopeWindowHours ?? historyWindowHours) * 60 * 60 * 1000)
     );
 
-    this.tradeTrackers = {
-      buy: new TradeAmountTracker(this.marketTradeWindowMs),
-      sell: new TradeAmountTracker(this.marketTradeWindowMs),
+    this.shortWindowTrackers = {
+      buy: new ShortWindowQuantileTracker(this.marketTradeShortWindowMs, this.marketTradeShortQuantile),
+      sell: new ShortWindowQuantileTracker(this.marketTradeShortWindowMs, this.marketTradeShortQuantile),
+    };
+    this.logZScoreTrackers = {
+      buy: new LogZScoreTracker(this.marketTradeZScoreWindowMs),
+      sell: new LogZScoreTracker(this.marketTradeZScoreWindowMs),
     };
   }
 
@@ -603,46 +691,79 @@ export class CvdAggregationWorker extends EventEmitter {
     }
 
     const direction: 'buy' | 'sell' = trade.direction === 'buy' ? 'buy' : 'sell';
-    const tracker = this.tradeTrackers[direction];
-    tracker.add(trade.timestamp, trade.amount);
-
-    if (!tracker.hasSamples(this.marketTradeMinSamples)) {
-      return;
-    }
-
-    const primaryThreshold = tracker.getQuantile(this.marketTradePrimaryQuantile);
-    if (primaryThreshold === null || trade.amount < primaryThreshold) {
-      return;
-    }
-
-    const alertType = this.getMarketTradeStartAlertType(direction);
     const cutoff = Date.now() - this.suppressionWindowMs;
 
-    if (!(await this.databaseManager.hasRecentAlertOrPending(alertType, cutoff))) {
-      const secondary = tracker.getQuantile(this.marketTradeSecondaryQuantile);
-      const scale = tracker.getIqrScale();
-      const payload: MarketTradeStartPayload = {
-        symbol: trade.symbol,
-        timestamp: trade.timestamp,
-        tradeId: trade.tradeId,
-        direction,
-        amount: trade.amount,
-        quantile: primaryThreshold,
-        quantileLevel: this.marketTradePrimaryQuantile,
-        threshold: primaryThreshold,
-        windowHours: tracker.getWindowHours(),
-      };
-      if (secondary !== null && secondary !== undefined) {
-        payload.secondaryQuantile = secondary;
-      }
-      if (scale !== null && scale !== undefined) {
-        payload.scale = scale;
-      }
+    const shortTracker = this.shortWindowTrackers[direction];
+    const zScoreTracker = this.logZScoreTrackers[direction];
 
-      await this.databaseManager.enqueueAlert(alertType, payload, trade.timestamp);
+    shortTracker.prune(trade.timestamp);
+    zScoreTracker.prune(trade.timestamp);
+
+    const shortSampleCount = shortTracker.getSampleCount();
+    const shortThreshold = shortTracker.getQuantile();
+    const shouldTriggerShort =
+      shortSampleCount >= this.marketTradeShortMinSamples &&
+      shortThreshold !== null &&
+      trade.amount >= shortThreshold;
+
+    const zScoreEligible = zScoreTracker.getSampleCount() >= this.marketTradeZScoreMinSamples;
+    const zScoreResult = zScoreEligible ? zScoreTracker.getZScore(trade.amount) : null;
+    const shouldTriggerZScore =
+      zScoreResult !== null && zScoreResult.zScore >= this.marketTradeZScoreThreshold;
+
+    shortTracker.addSample(trade.timestamp, trade.amount);
+    zScoreTracker.addSample(trade.timestamp, trade.amount);
+
+    let triggered = false;
+
+    if (shouldTriggerShort && shortThreshold !== null) {
+      const alertType = this.getMarketTradeAlertType('SHORT_WINDOW_QUANTILE', direction);
+      if (!(await this.databaseManager.hasRecentAlertOrPending(alertType, cutoff))) {
+        const payload: MarketTradeStartPayload = {
+          symbol: trade.symbol,
+          timestamp: trade.timestamp,
+          tradeId: trade.tradeId,
+          direction,
+          amount: trade.amount,
+          strategy: 'SHORT_WINDOW_QUANTILE',
+          threshold: shortThreshold,
+          quantile: shortThreshold,
+          quantileLevel: this.marketTradeShortQuantile,
+          windowMinutes: shortTracker.getWindowMinutes(),
+          sampleCount: shortSampleCount,
+        };
+        await this.databaseManager.enqueueAlert(alertType, payload, trade.timestamp);
+        triggered = true;
+      }
     }
 
-    this.lastTradeStartTimestamp[direction] = trade.timestamp;
+    if (shouldTriggerZScore && zScoreResult) {
+      const alertType = this.getMarketTradeAlertType('LOG_Z_SCORE', direction);
+      if (!(await this.databaseManager.hasRecentAlertOrPending(alertType, cutoff))) {
+        const payload: MarketTradeStartPayload = {
+          symbol: trade.symbol,
+          timestamp: trade.timestamp,
+          tradeId: trade.tradeId,
+          direction,
+          amount: trade.amount,
+          strategy: 'LOG_Z_SCORE',
+          threshold: this.marketTradeZScoreThreshold,
+          windowMinutes: zScoreTracker.getWindowMinutes(),
+          sampleCount: zScoreResult.sampleCount,
+          zScore: zScoreResult.zScore,
+          zScoreThreshold: this.marketTradeZScoreThreshold,
+          logMean: zScoreResult.mean,
+          logStdDev: zScoreResult.std,
+          logAmount: zScoreResult.logAmount,
+        };
+        await this.databaseManager.enqueueAlert(alertType, payload, trade.timestamp);
+        triggered = true;
+      }
+    }
+
+    if (triggered) {
+      this.lastTradeStartTimestamp[direction] = trade.timestamp;
+    }
   }
 
   private async evaluateCvdDeltaAlert(
@@ -800,8 +921,12 @@ export class CvdAggregationWorker extends EventEmitter {
     return `CVD_DELTA_${spanMinutes}M_${directionLabel}`;
   }
 
-  private getMarketTradeStartAlertType(direction: 'buy' | 'sell'): string {
-    return direction === 'buy' ? 'MARKET_TRADE_START_BUY' : 'MARKET_TRADE_START_SELL';
+  private getMarketTradeAlertType(strategy: MarketTradeStartStrategy, direction: 'buy' | 'sell'): string {
+    const prefix =
+      strategy === 'SHORT_WINDOW_QUANTILE'
+        ? 'MARKET_TRADE_START_SHORT_WINDOW'
+        : 'MARKET_TRADE_START_LOG_Z';
+    return direction === 'buy' ? `${prefix}_BUY` : `${prefix}_SELL`;
   }
 
   private getCvdSlopeAlertType(spanMinutes: number, direction: 'buy' | 'sell'): string {

@@ -53,14 +53,16 @@ export class ConfigManager implements IConfigManager {
     const analyticsAlertIntervalMs = this.getNumberEnvVar('ANALYTICS_ALERT_INTERVAL_MS', analyticsInterval);
     const blockTradePollIntervalMs = this.getNumberEnvVar('BLOCK_TRADE_POLL_INTERVAL_MS', 10000);
     const blockTradeAmountThreshold = this.getNumberEnvVar('BLOCK_TRADE_AMOUNT_THRESHOLD', 1000);
-    const marketTradeWindowHours = this.getNumberEnvVar('MARKET_TRADE_WINDOW_HOURS', 72);
-    const marketTradePrimaryQuantile = this.getNumberEnvVar('MARKET_TRADE_PRIMARY_QUANTILE', 0.99);
-    const marketTradeSecondaryQuantile = this.getNumberEnvVar('MARKET_TRADE_SECONDARY_QUANTILE', 0.95);
-    const marketTradeMinSamples = this.getNumberEnvVar('MARKET_TRADE_MIN_SAMPLES', 500);
+    const marketTradeShortWindowMinutes = this.getNumberEnvVar('MARKET_TRADE_SHORT_WINDOW_MINUTES', 30);
+    const marketTradeShortQuantile = this.getNumberEnvVar('MARKET_TRADE_SHORT_QUANTILE', 0.99);
+    const marketTradeShortMinSamples = this.getNumberEnvVar('MARKET_TRADE_SHORT_MIN_SAMPLES', 200);
+    const marketTradeZScoreWindowMinutes = this.getNumberEnvVar('MARKET_TRADE_ZSCORE_WINDOW_MINUTES', 360);
+    const marketTradeZScoreThreshold = this.getNumberEnvVar('MARKET_TRADE_ZSCORE_THRESHOLD', 3);
+    const marketTradeZScoreMinSamples = this.getNumberEnvVar('MARKET_TRADE_ZSCORE_MIN_SAMPLES', 200);
     const marketTradeLinkMinutes = this.getNumberEnvVar('MARKET_TRADE_LINK_MINUTES', 10);
     const cvdSlopeThreshold = this.getNumberEnvVar('CVD_SLOPE_THRESHOLD', 1.5);
     const cvdSlopeEmaAlpha = this.getNumberEnvVar('CVD_SLOPE_EMA_ALPHA', 0.3);
-    const cvdSlopeWindowHours = this.getNumberEnvVar('CVD_SLOPE_WINDOW_HOURS', marketTradeWindowHours);
+    const cvdSlopeWindowHours = this.getNumberEnvVar('CVD_SLOPE_WINDOW_HOURS', 72);
 
     const config: AppConfig = {
       discordWebhookUrl: this.getRequiredEnvVar('DISCORD_WEBHOOK_URL'),
@@ -90,10 +92,12 @@ export class ConfigManager implements IConfigManager {
       analyticsIntervalMs: analyticsInterval,
       analyticsInstrumentRefreshIntervalMs: analyticsRefreshInterval,
       analyticsRatioWindowUsd: analyticsRatioWindowUsd,
-      marketTradeWindowHours,
-      marketTradePrimaryQuantile,
-      marketTradeSecondaryQuantile,
-      marketTradeMinSamples,
+      marketTradeShortWindowMinutes,
+      marketTradeShortQuantile,
+      marketTradeShortMinSamples,
+      marketTradeZScoreWindowMinutes,
+      marketTradeZScoreThreshold,
+      marketTradeZScoreMinSamples,
       marketTradeLinkMinutes,
       cvdSlopeThreshold,
       cvdSlopeEmaAlpha,
@@ -215,34 +219,31 @@ export class ConfigManager implements IConfigManager {
       errors.push('CVD_AGGREGATION_SYMBOL must not be empty');
     }
 
-    if (config.marketTradeWindowHours !== undefined && config.marketTradeWindowHours <= 0) {
-      errors.push('MARKET_TRADE_WINDOW_HOURS must be greater than 0');
+    if (config.marketTradeShortWindowMinutes !== undefined && config.marketTradeShortWindowMinutes <= 0) {
+      errors.push('MARKET_TRADE_SHORT_WINDOW_MINUTES must be greater than 0');
     }
 
     if (
-      config.marketTradePrimaryQuantile !== undefined &&
-      (config.marketTradePrimaryQuantile <= 0 || config.marketTradePrimaryQuantile >= 1)
+      config.marketTradeShortQuantile !== undefined &&
+      (config.marketTradeShortQuantile <= 0 || config.marketTradeShortQuantile >= 1)
     ) {
-      errors.push('MARKET_TRADE_PRIMARY_QUANTILE must be between 0 and 1');
+      errors.push('MARKET_TRADE_SHORT_QUANTILE must be between 0 and 1');
     }
 
-    if (
-      config.marketTradeSecondaryQuantile !== undefined &&
-      (config.marketTradeSecondaryQuantile <= 0 || config.marketTradeSecondaryQuantile >= 1)
-    ) {
-      errors.push('MARKET_TRADE_SECONDARY_QUANTILE must be between 0 and 1');
+    if (config.marketTradeShortMinSamples !== undefined && config.marketTradeShortMinSamples <= 0) {
+      errors.push('MARKET_TRADE_SHORT_MIN_SAMPLES must be greater than 0');
     }
 
-    if (
-      config.marketTradePrimaryQuantile !== undefined &&
-      config.marketTradeSecondaryQuantile !== undefined &&
-      config.marketTradeSecondaryQuantile > config.marketTradePrimaryQuantile
-    ) {
-      errors.push('MARKET_TRADE_SECONDARY_QUANTILE must be less than or equal to MARKET_TRADE_PRIMARY_QUANTILE');
+    if (config.marketTradeZScoreWindowMinutes !== undefined && config.marketTradeZScoreWindowMinutes <= 0) {
+      errors.push('MARKET_TRADE_ZSCORE_WINDOW_MINUTES must be greater than 0');
     }
 
-    if (config.marketTradeMinSamples !== undefined && config.marketTradeMinSamples <= 0) {
-      errors.push('MARKET_TRADE_MIN_SAMPLES must be greater than 0');
+    if (config.marketTradeZScoreThreshold !== undefined && config.marketTradeZScoreThreshold <= 0) {
+      errors.push('MARKET_TRADE_ZSCORE_THRESHOLD must be greater than 0');
+    }
+
+    if (config.marketTradeZScoreMinSamples !== undefined && config.marketTradeZScoreMinSamples <= 0) {
+      errors.push('MARKET_TRADE_ZSCORE_MIN_SAMPLES must be greater than 0');
     }
 
     if (config.marketTradeLinkMinutes !== undefined && config.marketTradeLinkMinutes < 0) {

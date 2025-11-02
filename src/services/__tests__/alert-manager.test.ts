@@ -271,20 +271,38 @@ describe('AlertManager', () => {
   });
 
   describe('sendMarketTradeStartAlert', () => {
-    const payload: MarketTradeStartPayload = {
+    const shortPayload: MarketTradeStartPayload = {
       symbol: 'BTC-PERP',
       timestamp: Date.now(),
       tradeId: 'trade-123',
       direction: 'buy',
-      amount: 15000,
-      quantile: 12000,
+      amount: 1.5,
+      strategy: 'SHORT_WINDOW_QUANTILE',
+      threshold: 1.2,
+      windowMinutes: 30,
+      sampleCount: 250,
       quantileLevel: 0.99,
-      secondaryQuantile: 9000,
-      threshold: 12000,
-      windowHours: 72,
+      quantile: 1.2,
     };
 
-    it('sends formatted payload to Discord and records history', async () => {
+    const zScorePayload: MarketTradeStartPayload = {
+      symbol: 'BTC-PERP',
+      timestamp: Date.now(),
+      tradeId: 'trade-456',
+      direction: 'sell',
+      amount: 2.4,
+      strategy: 'LOG_Z_SCORE',
+      threshold: 3,
+      windowMinutes: 360,
+      sampleCount: 800,
+      zScore: 3.4,
+      zScoreThreshold: 3,
+      logMean: 0.1,
+      logStdDev: 0.25,
+      logAmount: Math.log(2.4),
+    };
+
+    it('sends short-window payload to Discord and records history', async () => {
       const db = createMockDatabaseManager();
       const httpClient = { post: jest.fn().mockResolvedValue({ status: 204 }) };
 
@@ -293,13 +311,35 @@ describe('AlertManager', () => {
         httpClient,
       });
 
-      await manager.sendMarketTradeStartAlert(payload);
+      await manager.sendMarketTradeStartAlert(shortPayload);
 
       expect(httpClient.post).toHaveBeenCalledTimes(1);
       expect(db.saveAlertHistory).toHaveBeenCalledWith(
         expect.objectContaining({
-          alertType: 'MARKET_TRADE_START_BUY',
-          threshold: payload.threshold,
+          alertType: 'MARKET_TRADE_START_SHORT_WINDOW_BUY',
+          threshold: shortPayload.threshold,
+          value: shortPayload.amount,
+        }),
+      );
+    });
+
+    it('sends log Z-score payload and stores metric thresholds', async () => {
+      const db = createMockDatabaseManager();
+      const httpClient = { post: jest.fn().mockResolvedValue({ status: 204 }) };
+
+      const manager = new AlertManager(db, {
+        webhookUrl,
+        httpClient,
+      });
+
+      await manager.sendMarketTradeStartAlert(zScorePayload);
+
+      expect(httpClient.post).toHaveBeenCalledTimes(1);
+      expect(db.saveAlertHistory).toHaveBeenCalledWith(
+        expect.objectContaining({
+          alertType: 'MARKET_TRADE_START_LOG_Z_SELL',
+          threshold: zScorePayload.zScoreThreshold,
+          value: zScorePayload.zScore,
         }),
       );
     });
@@ -314,7 +354,7 @@ describe('AlertManager', () => {
         maxRetries: 0,
       });
 
-      await expect(manager.sendMarketTradeStartAlert(payload)).rejects.toThrow('discord down');
+      await expect(manager.sendMarketTradeStartAlert(shortPayload)).rejects.toThrow('discord down');
       expect(db.saveAlertHistory).not.toHaveBeenCalled();
     });
   });

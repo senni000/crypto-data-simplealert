@@ -147,19 +147,36 @@ export interface CvdDeltaAlertPayload {
   windowHours: number;
 }
 
-export interface MarketTradeStartPayload {
+export type MarketTradeStartStrategy = 'SHORT_WINDOW_QUANTILE' | 'LOG_Z_SCORE';
+
+interface MarketTradeStartBasePayload {
   symbol: string;
   timestamp: number;
   tradeId: string;
   direction: 'buy' | 'sell';
   amount: number;
-  quantile: number;
-  quantileLevel: number;
-  secondaryQuantile?: number;
-  scale?: number;
+  strategy: MarketTradeStartStrategy;
   threshold: number;
-  windowHours: number;
+  windowMinutes: number;
+  sampleCount: number;
 }
+
+export interface MarketTradeShortWindowPayload extends MarketTradeStartBasePayload {
+  strategy: 'SHORT_WINDOW_QUANTILE';
+  quantileLevel: number;
+  quantile: number;
+}
+
+export interface MarketTradeLogZScorePayload extends MarketTradeStartBasePayload {
+  strategy: 'LOG_Z_SCORE';
+  zScore: number;
+  zScoreThreshold: number;
+  logMean: number;
+  logStdDev: number;
+  logAmount: number;
+}
+
+export type MarketTradeStartPayload = MarketTradeShortWindowPayload | MarketTradeLogZScorePayload;
 
 export interface CvdSlopeAlertPayload {
   symbol: string;
