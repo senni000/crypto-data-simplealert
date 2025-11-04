@@ -28,6 +28,8 @@ async function bootstrap(): Promise<void> {
   const alertManager = new AlertManager(databaseManager, {
     webhookUrl: config.discordWebhookUrl,
     cvdCooldownMinutes: config.cvdAlertSuppressionMinutes,
+    enableCvdSlopeDiscord: false,
+    enableCvdDelta5mDiscord: false,
   });
 
   const queueProcessor = new AlertQueueProcessor(databaseManager, alertManager, {
@@ -48,7 +50,7 @@ async function bootstrap(): Promise<void> {
       : null;
 
   const skewReporter =
-    config.analyticsEnabled && config.enableCvdAlerts
+    config.analyticsEnabled && config.enableSkewChartReporter
       ? new SkewChartReporter(databaseManager, alertManager)
       : null;
 

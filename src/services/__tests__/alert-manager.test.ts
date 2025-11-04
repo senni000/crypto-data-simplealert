@@ -7,7 +7,8 @@ import {
   CVDData,
   AlertHistory,
   CvdDeltaAlertPayload,
-  MarketTradeSpikePayload,
+  MarketTradeStartPayload,
+  CvdSlopeAlertPayload,
 } from '../../types';
 
 type MockedDatabaseManager = jest.Mocked<IDatabaseManager>;
@@ -37,6 +38,7 @@ const createMockDatabaseManager = (): MockedDatabaseManager => ({
   markAlertProcessed: jest.fn().mockResolvedValue(undefined),
   markAlertFailed: jest.fn().mockResolvedValue(undefined),
   hasRecentAlertOrPending: jest.fn().mockResolvedValue(false),
+  pruneOlderThan: jest.fn().mockResolvedValue(undefined),
   closeDatabase: jest.fn().mockResolvedValue(undefined),
 });
 
@@ -268,6 +270,26 @@ describe('AlertManager', () => {
       await expect(manager.sendCvdAlertPayload(payload)).rejects.toThrow('discord down');
       expect(db.saveAlertHistory).not.toHaveBeenCalled();
     });
+
+    it('skips Discord when 5m alerts are disabled but records history', async () => {
+      const db = createMockDatabaseManager();
+      const httpClient = { post: jest.fn().mockResolvedValue({ status: 204 }) };
+
+      const manager = new AlertManager(db, {
+        webhookUrl,
+        httpClient,
+        enableCvdDelta5mDiscord: false,
+      });
+
+      await manager.sendCvdAlertPayload(payload);
+
+      expect(httpClient.post).not.toHaveBeenCalled();
+      expect(db.saveAlertHistory).toHaveBeenCalledWith(
+        expect.objectContaining({
+          alertType: 'CVD_DELTA_5M_BUY',
+        }),
+      );
+    });
   });
 
   describe('sendMarketTradeStartAlert', () => {
@@ -323,7 +345,7 @@ describe('AlertManager', () => {
       );
     });
 
-    it('sends log Z-score payload and stores metric thresholds', async () => {
+  it('sends log Z-score payload and stores metric thresholds', async () => {
       const db = createMockDatabaseManager();
       const httpClient = { post: jest.fn().mockResolvedValue({ status: 204 }) };
 
@@ -356,6 +378,40 @@ describe('AlertManager', () => {
 
       await expect(manager.sendMarketTradeStartAlert(shortPayload)).rejects.toThrow('discord down');
       expect(db.saveAlertHistory).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('sendCvdSlopeAlert', () => {
+    const payload: CvdSlopeAlertPayload = {
+      symbol: 'BTC-PERP',
+      timestamp: Date.now(),
+      bucketSpanMinutes: 5,
+      delta: 1200,
+      slope: 15,
+      slopeZ: 2.5,
+      threshold: 1.5,
+      direction: 'buy',
+      windowHours: 72,
+    };
+
+    it('skips Discord when slope alerts are disabled but records history', async () => {
+      const db = createMockDatabaseManager();
+      const httpClient = { post: jest.fn().mockResolvedValue({ status: 204 }) };
+
+      const manager = new AlertManager(db, {
+        webhookUrl,
+        httpClient,
+        enableCvdSlopeDiscord: false,
+      });
+
+      await manager.sendCvdSlopeAlert(payload);
+
+      expect(httpClient.post).not.toHaveBeenCalled();
+      expect(db.saveAlertHistory).toHaveBeenCalledWith(
+        expect.objectContaining({
+          alertType: 'CVD_SLOPE_5M_BUY',
+        }),
+      );
     });
   });
 });

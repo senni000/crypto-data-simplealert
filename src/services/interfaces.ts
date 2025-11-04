@@ -53,6 +53,7 @@ export interface AppConfig {
   analyticsInstrumentRefreshIntervalMs: number;
   analyticsRatioWindowUsd: number;
   enableCvdAlerts: boolean;
+  enableSkewChartReporter: boolean;
   marketTradeShortWindowMinutes: number;
   marketTradeShortQuantile: number;
   marketTradeShortMinSamples: number;

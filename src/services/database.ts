@@ -53,11 +53,12 @@ export class DatabaseManager implements IDatabaseManager {
             return;
           }
 
-          // Create tables and indexes
-          this.createTables()
+          this.configureDatabase()
+            .then(() => this.createTables())
             .then(() => this.ensureAnalyticsColumns())
             .then(() => this.ensureTradeAugmentationColumns())
             .then(() => this.ensureCvdDeltaColumns())
+            .then(() => this.deduplicatePendingTradeAlerts())
             .then(() => this.createIndexes())
             .then(() => {
               console.log('Database initialized successfully');
@@ -69,6 +70,25 @@ export class DatabaseManager implements IDatabaseManager {
         console.error('Failed to initialize database:', error);
         reject(error);
       }
+    });
+  }
+
+  private async configureDatabase(): Promise<void> {
+    const db = this.getDatabase();
+    return new Promise((resolve, reject) => {
+      db.serialize(() => {
+        db.exec(
+          'PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout = 5000;',
+          (err) => {
+            if (err) {
+              console.error('Failed to apply database pragmas:', err);
+              reject(err);
+            } else {
+              resolve();
+            }
+          }
+        );
+      });
     });
   }
 
@@ -254,6 +274,33 @@ export class DatabaseManager implements IDatabaseManager {
     }
   }
 
+  private async deduplicatePendingTradeAlerts(): Promise<void> {
+    const db = this.getDatabase();
+
+    const deleteSql = `
+      DELETE FROM alert_queue
+      WHERE processed_at IS NULL
+        AND json_extract(payload_json, '$.tradeId') IS NOT NULL
+        AND id NOT IN (
+          SELECT MIN(id)
+          FROM alert_queue
+          WHERE processed_at IS NULL
+            AND json_extract(payload_json, '$.tradeId') IS NOT NULL
+          GROUP BY alert_type, json_extract(payload_json, '$.tradeId')
+        )
+    `;
+
+    await new Promise<void>((resolve, reject) => {
+      db.run(deleteSql, (err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
   /**
    * Create database indexes for performance optimization
    */
@@ -275,7 +322,11 @@ export class DatabaseManager implements IDatabaseManager {
       'CREATE INDEX IF NOT EXISTS idx_skew_raw_data_timestamp ON skew_raw_data(timestamp)',
       'CREATE INDEX IF NOT EXISTS idx_skew_raw_data_bucket ON skew_raw_data(expiry_type, delta_bucket, option_type)',
       'CREATE INDEX IF NOT EXISTS idx_processing_state_lookup ON processing_state(process_name, key)',
-      'CREATE INDEX IF NOT EXISTS idx_alert_queue_pending ON alert_queue(processed_at, id)'
+      'CREATE INDEX IF NOT EXISTS idx_alert_queue_pending ON alert_queue(processed_at, id)',
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_queue_trade_pending
+         ON alert_queue(alert_type, json_extract(payload_json, '$.tradeId'))
+         WHERE processed_at IS NULL
+           AND json_extract(payload_json, '$.tradeId') IS NOT NULL`
     ];
 
     return new Promise((resolve, reject) => {
@@ -753,22 +804,27 @@ export class DatabaseManager implements IDatabaseManager {
       VALUES (?, ?, ?, ?, ?)
     `;
 
-    return new Promise((resolve, reject) => {
-      db.run(insertSql, [
-        alert.alertType,
-        alert.timestamp,
-        alert.value,
-        alert.threshold,
-        alert.message
-      ], (err) => {
-        if (err) {
-          console.error('Failed to save alert history:', err);
-          reject(err);
-        } else {
-          resolve();
-        }
+    const runInsert = () =>
+      new Promise<void>((resolve, reject) => {
+        db.run(
+          insertSql,
+          [alert.alertType, alert.timestamp, alert.value, alert.threshold, alert.message],
+          (err) => {
+            if (err) {
+              reject(err);
+            } else {
+              resolve();
+            }
+          }
+        );
       });
-    });
+
+    try {
+      await this.executeWithRetry(runInsert);
+    } catch (error) {
+      console.error('Failed to save alert history:', error);
+      throw error;
+    }
   }
 
   /**
@@ -792,16 +848,23 @@ export class DatabaseManager implements IDatabaseManager {
       ORDER BY timestamp DESC
     `;
 
-    return new Promise((resolve, reject) => {
-      db.all(selectSql, [alertType, timeThreshold], (err, rows) => {
-        if (err) {
-          console.error('Failed to get recent alerts:', err);
-          reject(err);
-        } else {
-          resolve(rows as AlertHistory[]);
-        }
+    const runQuery = () =>
+      new Promise<AlertHistory[]>((resolve, reject) => {
+        db.all(selectSql, [alertType, timeThreshold], (err, rows) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(rows as AlertHistory[]);
+          }
+        });
       });
-    });
+
+    try {
+      return await this.executeWithRetry(runQuery);
+    } catch (error) {
+      console.error('Failed to get recent alerts:', error);
+      throw error;
+    }
   }
 
   /**
@@ -871,20 +934,59 @@ export class DatabaseManager implements IDatabaseManager {
     const db = this.getDatabase();
 
     const insertSql = `
-      INSERT INTO alert_queue (alert_type, timestamp, payload_json)
+      INSERT OR IGNORE INTO alert_queue (alert_type, timestamp, payload_json)
       VALUES (?, ?, ?)
     `;
 
-    return new Promise((resolve, reject) => {
-      db.run(insertSql, [alertType, timestamp, JSON.stringify(payload)], function (err) {
-        if (err) {
-          console.error('Failed to enqueue alert payload:', err);
-          reject(err);
-        } else {
-          resolve(Number(this.lastID));
-        }
+    const runInsert = () =>
+      new Promise<number>((resolve, reject) => {
+        db.run(insertSql, [alertType, timestamp, JSON.stringify(payload)], function (err) {
+          if (err) {
+            reject(err);
+            return;
+          }
+
+          if (this.changes && this.changes > 0) {
+            resolve(Number(this.lastID));
+            return;
+          }
+
+          const tradeId = DatabaseManager.extractTradeId(payload);
+          if (!tradeId) {
+            resolve(Number(this.lastID));
+            return;
+          }
+
+          db.get(
+            `
+              SELECT id
+              FROM alert_queue
+              WHERE processed_at IS NULL
+                AND alert_type = ?
+                AND json_extract(payload_json, '$.tradeId') = ?
+              ORDER BY id ASC
+              LIMIT 1
+            `,
+            [alertType, tradeId],
+            (lookupErr, row: { id?: number } | undefined) => {
+              if (lookupErr) {
+                reject(lookupErr);
+              } else if (row && typeof row.id === 'number') {
+                resolve(Number(row.id));
+              } else {
+                resolve(Number(this.lastID));
+              }
+            }
+          );
+        });
       });
-    });
+
+    try {
+      return await this.executeWithRetry(runInsert);
+    } catch (error) {
+      console.error('Failed to enqueue alert payload:', error);
+      throw error;
+    }
   }
 
   /**
@@ -975,16 +1077,23 @@ export class DatabaseManager implements IDatabaseManager {
       WHERE id = ?
     `;
 
-    return new Promise((resolve, reject) => {
-      db.run(updateSql, [Date.now(), id], (err) => {
-        if (err) {
-          console.error('Failed to mark alert as processed:', err);
-          reject(err);
-        } else {
-          resolve();
-        }
+    const runUpdate = () =>
+      new Promise<void>((resolve, reject) => {
+        db.run(updateSql, [Date.now(), id], (err) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
       });
-    });
+
+    try {
+      await this.executeWithRetry(runUpdate);
+    } catch (error) {
+      console.error('Failed to mark alert as processed:', error);
+      throw error;
+    }
   }
 
   /**
@@ -1001,16 +1110,23 @@ export class DatabaseManager implements IDatabaseManager {
       WHERE id = ?
     `;
 
-    return new Promise((resolve, reject) => {
-      db.run(updateSql, [error.message, id], (err) => {
-        if (err) {
-          console.error('Failed to update alert failure state:', err);
-          reject(err);
-        } else {
-          resolve();
-        }
+    const runUpdate = () =>
+      new Promise<void>((resolve, reject) => {
+        db.run(updateSql, [error.message, id], (err) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve();
+          }
+        });
       });
-    });
+
+    try {
+      await this.executeWithRetry(runUpdate);
+    } catch (updateError) {
+      console.error('Failed to update alert failure state:', updateError);
+      throw updateError;
+    }
   }
 
   /**
@@ -1019,49 +1135,54 @@ export class DatabaseManager implements IDatabaseManager {
   async hasRecentAlertOrPending(alertType: string, cutoffTimestamp: number): Promise<boolean> {
     const db = this.getDatabase();
 
-    const alertPromise = new Promise<boolean>((resolve, reject) => {
-      db.get(
-        `
-          SELECT 1
-          FROM alert_history
-          WHERE alert_type = ?
-            AND timestamp >= ?
-          LIMIT 1
-        `,
-        [alertType, cutoffTimestamp],
-        (err, row) => {
-          if (err) {
-            reject(err);
-          } else {
-            resolve(!!row);
-          }
-        }
-      );
-    });
-
-    const queuePromise = new Promise<boolean>((resolve, reject) => {
-      db.get(
-        `
-          SELECT 1
-          FROM alert_queue
-          WHERE alert_type = ?
-            AND processed_at IS NULL
-            AND timestamp >= ?
-          LIMIT 1
-        `,
-        [alertType, cutoffTimestamp],
-        (err, row) => {
-          if (err) {
-            reject(err);
-          } else {
-            resolve(!!row);
-          }
-        }
-      );
-    });
-
     try {
-      const [hasAlert, hasPending] = await Promise.all([alertPromise, queuePromise]);
+      const queryHistory = () =>
+        new Promise<boolean>((resolve, reject) => {
+          db.get(
+            `
+              SELECT 1
+              FROM alert_history
+              WHERE alert_type = ?
+                AND timestamp >= ?
+              LIMIT 1
+            `,
+            [alertType, cutoffTimestamp],
+            (err, row) => {
+              if (err) {
+                reject(err);
+              } else {
+                resolve(!!row);
+              }
+            }
+          );
+        });
+
+      const queryQueue = () =>
+        new Promise<boolean>((resolve, reject) => {
+          db.get(
+            `
+              SELECT 1
+              FROM alert_queue
+              WHERE alert_type = ?
+                AND processed_at IS NULL
+                AND timestamp >= ?
+              LIMIT 1
+            `,
+            [alertType, cutoffTimestamp],
+            (err, row) => {
+              if (err) {
+                reject(err);
+              } else {
+                resolve(!!row);
+              }
+            }
+          );
+        });
+
+      const [hasAlert, hasPending] = await Promise.all([
+        this.executeWithRetry(queryHistory),
+        this.executeWithRetry(queryQueue),
+      ]);
       return hasAlert || hasPending;
     } catch (error) {
       console.error('Failed to evaluate alert suppression state:', error);
@@ -1377,6 +1498,58 @@ export class DatabaseManager implements IDatabaseManager {
           }
         }
       );
+    });
+  }
+
+  private static extractTradeId(payload: QueuedAlertPayload): string | null {
+    const candidate = payload as Partial<MarketTradeStartPayload>;
+    if (candidate && typeof candidate.tradeId === 'string' && candidate.tradeId.trim().length > 0) {
+      return candidate.tradeId;
+    }
+    return null;
+  }
+
+  private async executeWithRetry<T>(operation: () => Promise<T>, retries = 5, baseDelayMs = 100): Promise<T> {
+    let attempt = 0;
+    let lastError: unknown;
+
+    while (attempt <= retries) {
+      try {
+        return await operation();
+      } catch (error) {
+        lastError = error;
+        if (!this.isBusyError(error) || attempt === retries) {
+          throw error;
+        }
+        attempt += 1;
+        const backoff = baseDelayMs * attempt;
+        await this.delay(backoff);
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  private isBusyError(error: unknown): boolean {
+    if (error === null || error === undefined) {
+      return false;
+    }
+
+    const maybeError = error as { code?: string; message?: string };
+    const code = maybeError.code ?? '';
+    const message = maybeError.message ?? '';
+
+    return (
+      code === 'SQLITE_BUSY' ||
+      code === 'SQLITE_LOCKED' ||
+      message.includes('SQLITE_BUSY') ||
+      message.includes('SQLITE_LOCKED')
+    );
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
     });
   }
 

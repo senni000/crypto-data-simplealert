@@ -33,6 +33,7 @@ export class ConfigManager implements IConfigManager {
       retentionDays > 0 ? Math.floor(retentionDays * 24 * 60 * 60 * 1000) : null;
     const analyticsEnabled = this.getBooleanEnvVar('ENABLE_ANALYTICS_COLLECTION', true);
     const enableCvdAlerts = this.getBooleanEnvVar('ENABLE_CVD_ALERTS', true);
+    const enableSkewChartReporter = this.getBooleanEnvVar('ENABLE_SKEW_CHART_REPORTER', true);
     const analyticsInterval = this.getNumberEnvVar('ANALYTICS_INTERVAL_MS', 60000);
     const analyticsRefreshInterval = this.getNumberEnvVar('ANALYTICS_REFRESH_INTERVAL_MS', 3600000);
     const analyticsRatioWindowUsd = this.getNumberEnvVar('ANALYTICS_RATIO_WINDOW_USD', 5);
@@ -89,6 +90,7 @@ export class ConfigManager implements IConfigManager {
       databaseRetentionMs,
       analyticsEnabled,
       enableCvdAlerts,
+      enableSkewChartReporter,
       analyticsIntervalMs: analyticsInterval,
       analyticsInstrumentRefreshIntervalMs: analyticsRefreshInterval,
       analyticsRatioWindowUsd: analyticsRatioWindowUsd,

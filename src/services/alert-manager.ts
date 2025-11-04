@@ -33,6 +33,8 @@ export interface AlertManagerOptions {
   cpChangeThreshold?: number;
   cpCooldownMinutes?: number;
   httpClient?: HttpClient;
+  enableCvdSlopeDiscord?: boolean;
+  enableCvdDelta5mDiscord?: boolean;
 }
 
 export interface DiscordEmbedOptions {
@@ -73,6 +75,8 @@ export class AlertManager extends EventEmitter implements IAlertManager {
   private readonly movingAverageMonitor: MovingAverageMonitor;
   private readonly cvdCooldownMinutes: number;
   private readonly cpCooldownMinutes: number;
+  private readonly enableCvdSlopeDiscord: boolean;
+  private readonly enableCvdDelta5mDiscord: boolean;
 
   constructor(databaseManager: IDatabaseManager, options: AlertManagerOptions) {
     super();
@@ -89,6 +93,9 @@ export class AlertManager extends EventEmitter implements IAlertManager {
     this.cpCooldownMinutes = options.cpCooldownMinutes ?? 15;
     const cpCooldown = this.cpCooldownMinutes;
     this.movingAverageMonitor = new MovingAverageMonitor(cpPeriod, cpChangeThreshold, cpCooldown);
+
+    this.enableCvdSlopeDiscord = options.enableCvdSlopeDiscord ?? true;
+    this.enableCvdDelta5mDiscord = options.enableCvdDelta5mDiscord ?? true;
   }
 
   /**
@@ -356,7 +363,20 @@ export class AlertManager extends EventEmitter implements IAlertManager {
       message: this.buildCVDMessage(payload),
     };
 
-    await this.sendDiscordAlert(message);
+    const shouldSendDiscord = !(
+      payload.bucketSpanMinutes === 5 && !this.enableCvdDelta5mDiscord
+    );
+
+    if (shouldSendDiscord) {
+      await this.sendDiscordAlert(message);
+    } else {
+      logger.debug('CVD 5m alert Discord notification disabled; recording history only', {
+        alertType,
+        bucketSpanMinutes: payload.bucketSpanMinutes,
+        direction: payload.direction,
+      });
+    }
+
     await this.databaseManager.saveAlertHistory({
       alertType,
       timestamp: payload.timestamp,
@@ -497,7 +517,16 @@ export class AlertManager extends EventEmitter implements IAlertManager {
       message: this.buildCvdSlopeMessage(payload),
     };
 
-    await this.sendDiscordAlert(message);
+    if (this.enableCvdSlopeDiscord) {
+      await this.sendDiscordAlert(message);
+    } else {
+      logger.debug('CVD slope alert Discord notification disabled; recording history only', {
+        alertType,
+        bucketSpanMinutes: payload.bucketSpanMinutes,
+        direction: payload.direction,
+      });
+    }
+
     await this.databaseManager.saveAlertHistory({
       alertType,
       timestamp: payload.timestamp,
